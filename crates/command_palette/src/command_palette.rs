@@ -30,8 +30,14 @@ use zed_actions::{OpenZedUrl, command_palette::Toggle};
 
 pub fn init(cx: &mut App) {
     command_palette_hooks::init(cx);
+    cx.default_global::<LastCommandPaletteQuery>();
     cx.observe_new(CommandPalette::register).detach();
 }
+
+#[derive(Default)]
+struct LastCommandPaletteQuery(String);
+
+impl gpui::Global for LastCommandPaletteQuery {}
 
 impl ModalView for CommandPalette {}
 
@@ -109,6 +115,12 @@ impl CommandPalette {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let preserve_input = query.is_empty();
+        let query = if preserve_input {
+            cx.default_global::<LastCommandPaletteQuery>().0.clone()
+        } else {
+            query.to_owned()
+        };
         let filter = CommandPaletteFilter::try_global(cx);
 
         let commands = window
@@ -131,6 +143,7 @@ impl CommandPalette {
             entity,
             commands,
             previous_focus_handle,
+            preserve_input,
         );
 
         let picker = cx.new(|cx| {
@@ -138,7 +151,10 @@ impl CommandPalette {
             let picker = Picker::uniform_list(delegate, window, cx)
                 .reopenable(false, cx)
                 .show_scrollbar(true);
-            picker.set_query(query, window, cx);
+            picker.set_query(&query, window, cx);
+            if preserve_input && !query.is_empty() {
+                picker.select_query(window, cx);
+            }
             picker
         });
         Self { picker }
@@ -180,6 +196,7 @@ pub struct CommandPaletteDelegate {
         postage::dispatch::Receiver<(Vec<Command>, Vec<StringMatch>, CommandInterceptResult)>,
     )>,
     query_history: QueryHistory,
+    preserve_input: bool,
 }
 
 struct Command {
@@ -293,6 +310,7 @@ impl CommandPaletteDelegate {
         workspace: WeakEntity<Workspace>,
         commands: Vec<Command>,
         previous_focus_handle: FocusHandle,
+        preserve_input: bool,
     ) -> Self {
         Self {
             command_palette,
@@ -305,6 +323,7 @@ impl CommandPaletteDelegate {
             latest_query: String::new(),
             updating_matches: None,
             query_history: Default::default(),
+            preserve_input,
         }
     }
 
@@ -468,6 +487,10 @@ impl PickerDelegate for CommandPaletteDelegate {
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> gpui::Task<()> {
+        if self.preserve_input {
+            cx.default_global::<LastCommandPaletteQuery>().0.clone_from(&query);
+        }
+
         let settings = WorkspaceSettings::get_global(cx);
         if let Some(alias) = settings.command_aliases.get(&query) {
             query = alias.as_ref().to_owned();
