@@ -2,7 +2,9 @@
 Param(
     [Parameter()][Alias('i')][switch]$Install,
     [Parameter()][Alias('h')][switch]$Help,
+    [Parameter()][switch]$SkipRemoteServer,
     [Parameter()][Alias('a')][string]$Architecture,
+    [Parameter()][ValidateSet('stable', 'preview', 'nightly', 'dev')][string]$IconChannel,
     [Parameter()][string]$Name
 )
 
@@ -47,10 +49,12 @@ Pop-Location
 $target = "$Architecture-pc-windows-msvc"
 
 if ($Help) {
-    Write-Output "Usage: test.ps1 [-Install] [-Help]"
+    Write-Output "Usage: bundle-windows.ps1 [-Architecture <x86_64|aarch64>] [-IconChannel <stable|preview|nightly|dev>] [-SkipRemoteServer] [-Install]"
     Write-Output "Build the installer for Windows.\n"
     Write-Output "Options:"
     Write-Output "  -Architecture, -a Which architecture to build (x86_64 or aarch64)"
+    Write-Output "  -IconChannel      Override the application icon channel."
+    Write-Output "  -SkipRemoteServer Do not build the Remote Server release artifact."
     Write-Output "  -Install, -i      Run the installer after building."
     Write-Output "  -Help, -h         Show this help message."
     exit 0
@@ -61,6 +65,9 @@ $channel = Get-Content "RELEASE_CHANNEL"
 $env:ZED_RELEASE_CHANNEL = $channel
 $env:RELEASE_CHANNEL = $channel
 Pop-Location
+
+$IconChannel = if ($IconChannel) { $IconChannel } else { $channel }
+$env:ZED_APP_ICON_CHANNEL = $IconChannel
 
 function CheckEnvironmentVariables {
     if(-not $env:CI) {
@@ -159,9 +166,11 @@ function ZipZedAndItsFriendsDebug {
         ".\$CargoOutDir\zed.pdb",
         ".\$CargoOutDir\cli.pdb",
         ".\$CargoOutDir\auto_update_helper.pdb",
-        ".\$CargoOutDir\explorer_command_injector.pdb",
-        ".\$CargoOutDir\remote_server.pdb"
+        ".\$CargoOutDir\explorer_command_injector.pdb"
     )
+    if (-not $SkipRemoteServer) {
+        $items += ".\$CargoOutDir\remote_server.pdb"
+    }
 
     Compress-Archive -Path $items -DestinationPath ".\$CargoOutDir\zed-$env:RELEASE_VERSION-$env:ZED_RELEASE_CHANNEL.dbg.zip" -Force
 }
@@ -265,7 +274,6 @@ function BuildInstaller {
     switch ($channel) {
         "stable" {
             $appId = "{{2DB0DA96-CA55-49BB-AF4F-64AF36A86712}"
-            $appIconName = "app-icon"
             $appName = "Zed"
             $appDisplayName = "Zed"
             $appSetupName = "Zed-$Architecture"
@@ -279,7 +287,6 @@ function BuildInstaller {
         }
         "preview" {
             $appId = "{{F70E4811-D0E2-4D88-AC99-D63752799F95}"
-            $appIconName = "app-icon-preview"
             $appName = "Zed Preview"
             $appDisplayName = "Zed Preview"
             $appSetupName = "Zed-$Architecture"
@@ -293,7 +300,6 @@ function BuildInstaller {
         }
         "nightly" {
             $appId = "{{1BDB21D3-14E7-433C-843C-9C97382B2FE0}"
-            $appIconName = "app-icon-nightly"
             $appName = "Zed Nightly"
             $appDisplayName = "Zed Nightly"
             $appSetupName = "Zed-$Architecture"
@@ -307,7 +313,6 @@ function BuildInstaller {
         }
         "dev" {
             $appId = "{{8357632E-24A4-4F32-BA97-E575B4D1FE5D}"
-            $appIconName = "app-icon-dev"
             $appName = "Zed Dev"
             $appDisplayName = "Zed Dev"
             $appSetupName = "Zed-$Architecture"
@@ -323,6 +328,13 @@ function BuildInstaller {
             Write-Error "can't bundle installer for $channel."
             exit 1
         }
+    }
+
+    $appIconName = switch ($IconChannel) {
+        "stable" { "app-icon" }
+        "preview" { "app-icon-preview" }
+        "nightly" { "app-icon-nightly" }
+        "dev" { "app-icon-dev" }
     }
 
     # Windows runner 2022 default has iscc in PATH, https://github.com/actions/runner-images/blob/main/images/windows/Windows2022-Readme.md
@@ -385,7 +397,9 @@ CheckEnvironmentVariables
 PrepareForBundle
 GenerateLicenses
 BuildZedAndItsFriends
-BuildRemoteServer
+if (-not $SkipRemoteServer) {
+    BuildRemoteServer
+}
 MakeAppx
 SignZedAndItsFriends
 ZipZedAndItsFriendsDebug
@@ -402,7 +416,7 @@ if ($buildSuccess) {
     Write-Output "Build successful"
     if ($Install) {
         Write-Output "Installing Zed..."
-        Start-Process -FilePath "$env:ZED_WORKSPACE/target/ZedEditorUserSetup-x64-$env:RELEASE_VERSION.exe"
+        Start-Process -FilePath "$env:ZED_WORKSPACE/target/Zed-$Architecture.exe"
     }
     exit 0
 }
