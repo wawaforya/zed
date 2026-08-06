@@ -29,6 +29,13 @@ pub struct OpenRecentProject {
     pub index: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = welcome, no_json, no_register)]
+pub struct OpenRecentRemoteProject {
+    pub connection_options: remote::RemoteConnectionOptions,
+    pub paths: Vec<std::path::PathBuf>,
+}
+
 actions!(
     zed,
     [
@@ -303,6 +310,36 @@ impl WelcomePage {
     ) {
         if let Some(recent_workspaces) = &self.recent_workspaces {
             if let Some(workspace) = recent_workspaces.get(action.index) {
+
+                match &workspace.location {
+                    SerializedWorkspaceLocation::Local => {
+                        let paths = workspace.paths.paths().to_vec();
+                        let open_mode =
+                            match WorkspaceSettings::get_global(cx).default_open_behavior {
+                                DefaultOpenBehavior::ExistingWindow => OpenMode::Activate,
+                                DefaultOpenBehavior::NewWindow => OpenMode::NewWindow,
+                            };
+                        self.workspace
+                            .update(cx, |workspace, cx| {
+                                workspace
+                                    .open_workspace_for_paths(open_mode, paths, window, cx)
+                                    .detach_and_log_err(cx);
+                            })
+                            .log_err();
+                    }
+                    SerializedWorkspaceLocation::Remote(connection_options) => {
+                        window.dispatch_action(
+                            OpenRecentRemoteProject {
+                                connection_options: connection_options.clone(),
+                                paths: workspace.paths.paths().to_vec(),
+                            }
+                            .boxed_clone(),
+                            cx,
+                        );
+                    }
+                };
+                return;
+
                 let is_local = matches!(workspace.location, SerializedWorkspaceLocation::Local);
 
                 if is_local {
@@ -424,7 +461,7 @@ impl Render for WelcomePage {
             .as_ref()
             .into_iter()
             .flatten()
-            .take(5)
+            .take(20)
             .enumerate()
             .map(|(index, workspace)| {
                 self.render_recent_project(

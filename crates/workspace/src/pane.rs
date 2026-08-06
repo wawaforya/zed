@@ -1260,18 +1260,6 @@ impl Pane {
                     .insert(item.item_id(), (project_path, abs_path));
             }
         }
-        // If no destination index is specified, add or move the item after the
-        // active item (or at the start of tab bar, if the active item is pinned)
-        let mut insertion_index = {
-            cmp::min(
-                if let Some(destination_index) = destination_index {
-                    destination_index
-                } else {
-                    cmp::max(self.active_item_index + 1, self.pinned_count())
-                },
-                self.items.len(),
-            )
-        };
 
         // Does the item already exist?
         let project_entry_id = if item.buffer_kind(cx) == ItemBufferKind::Singleton {
@@ -1294,6 +1282,21 @@ impl Pane {
                 false
             }
         });
+
+        // If no destination index is specified, add new items at the end of the
+        // tab bar. Existing items retain the previous behavior of moving after
+        // the active item.
+        let mut insertion_index = cmp::min(
+            if let Some(destination_index) = destination_index {
+                destination_index
+            } else if existing_item_index.is_some() {
+                cmp::max(self.active_item_index + 1, self.pinned_count())
+            } else {
+                self.items.len()
+            },
+            self.items.len(),
+        );
+
         if let Some(existing_item_index) = existing_item_index {
             // If the item already exists, move it to the desired destination and activate it
 
@@ -5179,8 +5182,7 @@ mod tests {
             pane.activate_item(0, false, false, window, cx);
         });
         add_labeled_item(&pane, "X", false, cx);
-        // Respect activation order.
-        assert_item_labels(&pane, ["3", "X*", "5", "6", "7"], cx);
+        assert_item_labels(&pane, ["3", "5", "6", "7", "X*"], cx);
 
         for i in 0..7 {
             add_labeled_item(&pane, format!("D{}", i).as_str(), true, cx);
@@ -7263,7 +7265,7 @@ mod tests {
                 cx,
             );
         });
-        set_labeled_items(&pane, ["A", "D*", "B", "C"], cx);
+        assert_item_labels(&pane, ["A", "B", "C", "D*"], cx);
 
         //   b. Add with active item at the end of the item list
         set_labeled_items(&pane, ["A", "B", "C*"], cx);
@@ -7481,7 +7483,7 @@ mod tests {
             pane.activate_item(1, false, false, window, cx)
         });
         add_labeled_item(&pane, "1", false, cx);
-        assert_item_labels(&pane, ["A", "B", "1*", "C", "D"], cx);
+        assert_item_labels(&pane, ["A", "B", "C", "D", "1*"], cx);
 
         pane.update_in(cx, |pane, window, cx| {
             pane.close_active_item(
@@ -7570,7 +7572,7 @@ mod tests {
             pane.activate_item(1, false, false, window, cx)
         });
         add_labeled_item(&pane, "1", false, cx);
-        assert_item_labels(&pane, ["A", "B", "1*", "C", "D"], cx);
+        assert_item_labels(&pane, ["A", "B", "C", "D", "1*"], cx);
 
         pane.update_in(cx, |pane, window, cx| {
             pane.close_active_item(
@@ -7584,7 +7586,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_item_labels(&pane, ["A", "B", "C*", "D"], cx);
+        assert_item_labels(&pane, ["A", "B", "C", "D*"], cx);
 
         pane.update_in(cx, |pane, window, cx| {
             pane.activate_item(3, false, false, window, cx)
@@ -7660,7 +7662,7 @@ mod tests {
             pane.activate_item(1, false, false, window, cx)
         });
         add_labeled_item(&pane, "1", false, cx);
-        assert_item_labels(&pane, ["A", "B", "1*", "C", "D"], cx);
+        assert_item_labels(&pane, ["A", "B", "C", "D", "1*"], cx);
 
         pane.update_in(cx, |pane, window, cx| {
             pane.close_active_item(
@@ -7674,7 +7676,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_item_labels(&pane, ["A", "B*", "C", "D"], cx);
+        assert_item_labels(&pane, ["A", "B", "C", "D*"], cx);
 
         pane.update_in(cx, |pane, window, cx| {
             pane.activate_item(3, false, false, window, cx)
