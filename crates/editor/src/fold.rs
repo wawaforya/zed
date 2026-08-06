@@ -59,13 +59,22 @@ impl EditorSnapshot {
             Some(
                 Disclosure::new(("gutter_crease", buffer_row.0), !folded)
                     .toggle_state(folded)
-                    .on_click(window.listener_for(&editor, move |this, _e, window, cx| {
-                        if folded {
-                            this.unfold_at(buffer_row, window, cx);
-                        } else {
-                            this.fold_at(buffer_row, window, cx);
-                        }
-                    }))
+                    .on_click(window.listener_for(
+                        &editor,
+                        move |this, event: &ClickEvent, window, cx| {
+                            if folded {
+                                if event.modifiers().shift {
+                                    this.unfold_at_recursive(buffer_row, cx);
+                                } else {
+                                    this.unfold_at(buffer_row, window, cx);
+                                }
+                            } else if event.modifiers().shift {
+                                this.fold_at_recursive(buffer_row, window, cx);
+                            } else {
+                                this.fold_at(buffer_row, window, cx);
+                            }
+                        },
+                    ))
                     .into_any_element(),
             )
         } else {
@@ -440,6 +449,43 @@ impl Editor {
         }
     }
 
+    pub(crate) fn fold_at_recursive(
+        &mut self,
+        buffer_row: MultiBufferRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
+        let Some(root_crease) = display_map.crease_for_buffer_row(buffer_row) else {
+            return;
+        };
+        let root_range = root_crease.range().clone();
+        let autoscroll = self
+            .selections
+            .all::<Point>(&display_map)
+            .iter()
+            .any(|selection| root_range.overlaps(&selection.range()));
+
+        let buffer = display_map.buffer_snapshot();
+        let folded_ranges = display_map
+            .folds_in_range(MultiBufferOffset(0)..buffer.len())
+            .map(|fold| fold.range.start.to_point(buffer)..fold.range.end.to_point(buffer))
+            .collect::<HashSet<_>>();
+        let mut creases = Vec::new();
+        for row in root_range.start.row..=root_range.end.row {
+            if let Some(crease) =
+                display_map.crease_for_buffer_row_including_folded(MultiBufferRow(row))
+                && crease.range().start >= root_range.start
+                && crease.range().end <= root_range.end
+                && !folded_ranges.contains(crease.range())
+            {
+                creases.push(crease);
+            }
+        }
+
+        self.fold_creases(creases, autoscroll, window, cx);
+    }
+
     pub fn unfold_lines(&mut self, _: &UnfoldLines, _window: &mut Window, cx: &mut Context<Self>) {
         if self.buffer_kind(cx) == ItemBufferKind::Singleton {
             let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
@@ -515,6 +561,30 @@ impl Editor {
             .any(|selection| RangeExt::overlaps(&selection.range(), &intersection_range));
 
         self.unfold_ranges(&[intersection_range], true, autoscroll, cx);
+    }
+
+    pub(crate) fn unfold_at_recursive(
+        &mut self,
+        buffer_row: MultiBufferRow,
+        cx: &mut Context<Self>,
+    ) {
+        let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
+        let buffer = display_map.buffer_snapshot();
+        let root_range = display_map
+            .folds_in_range(MultiBufferOffset(0)..buffer.len())
+            .map(|fold| fold.range.start.to_point(buffer)..fold.range.end.to_point(buffer))
+            .filter(|range| range.start.row == buffer_row.0)
+            .max_by_key(|range| range.end);
+        let Some(root_range) = root_range else {
+            return;
+        };
+
+        let autoscroll = self
+            .selections
+            .all::<Point>(&display_map)
+            .iter()
+            .any(|selection| root_range.overlaps(&selection.range()));
+        self.unfold_ranges(&[root_range], false, autoscroll, cx);
     }
 
     pub fn unfold_all(
