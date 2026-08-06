@@ -740,6 +740,10 @@ impl PickerDelegate for TabSwitcherDelegate {
         self.selected_index
     }
 
+    fn select_on_hover(&self) -> bool {
+        false
+    }
+
     fn set_selected_index(
         &mut self,
         ix: usize,
