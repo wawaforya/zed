@@ -246,6 +246,13 @@ pub async fn open_remote_project(
         (window, workspace)
     };
 
+    let empty_workspace_to_replace = cx.update(|cx| {
+        initial_workspace
+            .read(cx)
+            .can_replace_with_project(cx)
+            .then(|| initial_workspace.clone())
+    });
+
     let mut remote_workspace = None;
     loop {
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
@@ -414,6 +421,13 @@ pub async fn open_remote_project(
             }
 
             Ok((workspace, items)) => {
+                if workspace.is_some()
+                    && let Some(empty_workspace) = empty_workspace_to_replace.as_ref()
+                {
+                    window.update(cx, |multi_workspace, _, cx| {
+                        multi_workspace.remove_replaced_empty_workspace(empty_workspace, cx);
+                    })?;
+                }
                 remote_workspace = workspace;
                 navigate_to_positions(&window, items, &paths_with_positions, cx);
             }
@@ -576,24 +590,43 @@ mod tests {
 
         drop(connect_guard);
 
+        let empty_project = project::Project::test(app_state.fs.clone(), [], cx).await;
+        let empty_window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(empty_project, window, cx));
+        let empty_workspace = empty_window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+
         let paths = vec![PathBuf::from(path!("/project"))];
-        let open_options = workspace::OpenOptions::default();
+        let open_options = workspace::OpenOptions {
+            requesting_window: Some(empty_window),
+            ..Default::default()
+        };
 
         let mut async_cx = cx.to_async();
         let result = open_remote_project(opts, paths, app_state, open_options, &mut async_cx).await;
 
         executor.run_until_parked();
 
-        assert!(result.is_ok(), "open_remote_project should succeed");
+        assert_eq!(
+            result.expect("open_remote_project should succeed"),
+            empty_window,
+            "the remote project should open in the existing empty window"
+        );
+        assert_eq!(
+            cx.update(|cx| cx.windows().len()),
+            1,
+            "opening the remote project should not create another window"
+        );
 
-        let windows = cx.update(|cx| cx.windows().len());
-        assert_eq!(windows, 1, "Should have opened a window");
-
-        let multi_workspace_handle =
-            cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
-
-        multi_workspace_handle
+        empty_window
             .update(cx, |multi_workspace, _, cx| {
+                assert_eq!(
+                    multi_workspace.workspaces().count(),
+                    1,
+                    "the replaced empty workspace should not be retained"
+                );
+                assert_ne!(multi_workspace.workspace(), &empty_workspace);
                 let workspace = multi_workspace.workspace().clone();
                 workspace.update(cx, |workspace, cx| {
                     let project = workspace.project().read(cx);

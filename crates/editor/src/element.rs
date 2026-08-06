@@ -3133,7 +3133,7 @@ impl EditorElement {
             LineWithInvisibles::from_chunks(
                 chunks,
                 style,
-                MAX_LINE_LEN,
+                crate::max_line_len(),
                 rows.len(),
                 &snapshot.mode,
                 editor_width,
@@ -10311,7 +10311,7 @@ pub fn layout_line(
     LineWithInvisibles::from_chunks(
         chunks,
         style,
-        MAX_LINE_LEN,
+        crate::max_line_len(),
         1,
         &snapshot.mode,
         text_width,
@@ -10676,7 +10676,7 @@ fn calculate_wrap_width(
 
     match soft_wrap {
         SoftWrap::GitDiff => None,
-        SoftWrap::None => Some(wrap_width_for(MAX_LINE_LEN as u32 / 2)),
+        SoftWrap::None => Some(wrap_width_for(crate::max_line_len() as u32 / 2)),
         SoftWrap::EditorWidth => Some(editor_width),
         SoftWrap::Bounded(column) => Some(editor_width.min(wrap_width_for(column))),
     }
@@ -12511,7 +12511,7 @@ mod tests {
 
         assert_eq!(
             calculate_wrap_width(SoftWrap::None, editor_width, em_width),
-            Some(px((MAX_LINE_LEN as f32 / 2.0 * 8.0).ceil())),
+            Some(px((crate::max_line_len() as f32 / 2.0 * 8.0).ceil())),
         );
 
         assert_eq!(

@@ -3708,6 +3708,13 @@ impl Workspace {
         })
     }
 
+    pub fn can_replace_with_project(&self, cx: &App) -> bool {
+        let project = self.project.read(cx);
+        !project.is_via_collab()
+            && project.worktrees(cx).next().is_none()
+            && !self.items(cx).any(|item| item.is_dirty(cx))
+    }
+
     pub fn open_workspace_for_paths(
         &mut self,
         // replace_current_window: bool,
@@ -3717,12 +3724,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Workspace>>> {
         let requesting_window = window.window_handle().downcast::<MultiWorkspace>();
-        let is_remote = self.project.read(cx).is_via_collab();
-        let has_worktree = self.project.read(cx).worktrees(cx).next().is_some();
-        let has_dirty_items = self.items(cx).any(|item| item.is_dirty(cx));
-
-        let workspace_is_empty = !is_remote && !has_worktree && !has_dirty_items;
-        if workspace_is_empty {
+        if self.can_replace_with_project(cx) {
             open_mode = OpenMode::Activate;
         }
 

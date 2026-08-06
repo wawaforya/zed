@@ -30,8 +30,14 @@ use zed_actions::{OpenZedUrl, command_palette::Toggle};
 
 pub fn init(cx: &mut App) {
     command_palette_hooks::init(cx);
+    cx.set_global(LastCommandPaletteQuery::default());
     cx.observe_new(CommandPalette::register).detach();
 }
+
+#[derive(Default)]
+struct LastCommandPaletteQuery(String);
+
+impl gpui::Global for LastCommandPaletteQuery {}
 
 impl ModalView for CommandPalette {}
 
@@ -73,7 +79,17 @@ impl CommandPalette {
         _: &mut Context<Workspace>,
     ) {
         workspace.register_action(|workspace, _: &Toggle, window, cx| {
-            Self::toggle(workspace, "", window, cx)
+            let query = cx.global::<LastCommandPaletteQuery>().0.clone();
+            Self::toggle(workspace, &query, window, cx);
+            if !query.is_empty()
+                && let Some(command_palette) = workspace.active_modal::<CommandPalette>(cx)
+            {
+                command_palette.update(cx, |command_palette, cx| {
+                    command_palette.picker.update(cx, |picker, cx| {
+                        picker.select_query(window, cx);
+                    });
+                });
+            }
         });
     }
 
@@ -364,6 +380,19 @@ impl CommandPaletteDelegate {
         }
     }
 
+    /// Recency rank for each command triggered directly from the palette.
+    fn recent_command_ranks(&self, cx: &App) -> HashMap<String, usize> {
+        if let Ok(commands) = CommandPaletteDB::global(cx).list_commands_used() {
+            commands
+                .into_iter()
+                .enumerate()
+                .map(|(rank, command)| (command.command_name, rank))
+                .collect()
+        } else {
+            HashMap::new()
+        }
+    }
+
     fn selected_command(&self) -> Option<&Command> {
         if self.matches.is_empty() {
             return None;
@@ -454,6 +483,8 @@ impl PickerDelegate for CommandPaletteDelegate {
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> gpui::Task<()> {
+        cx.global_mut::<LastCommandPaletteQuery>().0 = query.clone();
+
         let settings = WorkspaceSettings::get_global(cx);
         if let Some(alias) = settings.command_aliases.get(&query) {
             query = alias.as_ref().to_owned();
@@ -470,14 +501,17 @@ impl PickerDelegate for CommandPaletteDelegate {
 
         let task = cx.background_spawn({
             let mut commands = self.all_commands.clone();
-            let hit_counts = self.hit_counts(cx);
+            let recent_command_ranks = self.recent_command_ranks(cx);
             let executor = cx.background_executor().clone();
             let query = normalize_action_query(query_str);
             let query_for_link = query_str.to_string();
             async move {
                 commands.sort_by_key(|action| {
                     (
-                        Reverse(hit_counts.get(&action.name).cloned()),
+                        recent_command_ranks
+                            .get(&action.name)
+                            .copied()
+                            .unwrap_or(usize::MAX),
                         action.name.clone(),
                     )
                 });
