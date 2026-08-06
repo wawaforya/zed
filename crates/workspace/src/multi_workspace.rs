@@ -1400,6 +1400,19 @@ impl MultiWorkspace {
         cx.notify();
     }
 
+    pub fn remove_replaced_empty_workspace(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace() != workspace
+            && self.held_index(workspace).is_some()
+            && workspace.read(cx).can_replace_with_project(cx)
+        {
+            self.detach_workspace(workspace, cx);
+        }
+    }
+
     /// Detaches a workspace: clears session state, DB binding, cached
     /// group key, and emits `WorkspaceRemoved`. The DB row is preserved
     /// so the workspace still appears in the recent-projects list.
