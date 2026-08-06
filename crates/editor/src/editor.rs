@@ -299,6 +299,34 @@ pub(crate) const CURSORS_VISIBLE_FOR: Duration = Duration::from_millis(2000);
 pub const CODE_ACTIONS_DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(250);
 pub const SELECTION_HIGHLIGHT_DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(100);
 
+pub(crate) fn max_line_len() -> usize {
+    static MAX_LINE_LEN_VAL: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let value = match std::env::var("ZED_MAX_LINE_LEN") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => return MAX_LINE_LEN,
+            Err(error) => {
+                log::warn!("ignoring invalid ZED_MAX_LINE_LEN environment variable: {error}");
+                return MAX_LINE_LEN;
+            }
+        };
+
+        match value.parse::<usize>() {
+            Ok(value) if (2..=u32::MAX as usize).contains(&value) => {
+                log::info!("using ZED_MAX_LINE_LEN={value}");
+                value
+            }
+            _ => {
+                log::warn!(
+                    "ignoring invalid ZED_MAX_LINE_LEN={value:?}; expected an integer from 2 to {}",
+                    u32::MAX
+                );
+                MAX_LINE_LEN
+            }
+        }
+    });
+
+    *MAX_LINE_LEN_VAL
+}
 pub(crate) const CODE_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const FORMAT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const SCROLL_CENTER_TOP_BOTTOM_DEBOUNCE_TIMEOUT: Duration = Duration::from_secs(1);
