@@ -127,7 +127,7 @@ impl CommandPaletteDB {
             SELECT command_name, COUNT(1), MAX(last_invoked)
             FROM command_invocations
             GROUP BY command_name
-            ORDER BY COUNT(1) DESC
+            ORDER BY MAX(id) DESC
         }
     }
 
@@ -194,8 +194,8 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_lists_ordered_by_usage() {
-        let db = CommandPaletteDB::open_test_db("test_lists_ordered_by_usage").await;
+    async fn test_lists_ordered_by_recency() {
+        let db = CommandPaletteDB::open_test_db("test_lists_ordered_by_recency").await;
 
         let empty_commands = db.list_commands_used();
         match &empty_commands {
@@ -208,7 +208,7 @@ mod tests {
         db.write_command_invocation("go to line: toggle", "200")
             .await
             .unwrap();
-        db.write_command_invocation("editor: backspace", "")
+        db.write_command_invocation("go to line: toggle", "201")
             .await
             .unwrap();
         db.write_command_invocation("editor: backspace", "")
@@ -221,9 +221,9 @@ mod tests {
         let commands = commands.expect("is ok");
         assert_eq!(commands.len(), 2);
         assert_eq!(commands.as_slice()[0].command_name, "editor: backspace");
-        assert_eq!(commands.as_slice()[0].invocations, 2);
+        assert_eq!(commands.as_slice()[0].invocations, 1);
         assert_eq!(commands.as_slice()[1].command_name, "go to line: toggle");
-        assert_eq!(commands.as_slice()[1].invocations, 1);
+        assert_eq!(commands.as_slice()[1].invocations, 2);
     }
 
     #[gpui::test]

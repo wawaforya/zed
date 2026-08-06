@@ -483,6 +483,32 @@ pub fn init(cx: &mut App) {
             }
         }
     });
+    cx.on_action(|open_recent_remote: &workspace::welcome::OpenRecentRemoteProject, cx| {
+        let mut connection_options = open_recent_remote.connection_options.clone();
+        if let RemoteConnectionOptions::Ssh(connection) = &mut connection_options {
+            RemoteSettings::get_global(cx).fill_connection_options_from_settings(connection);
+        }
+        let paths = open_recent_remote.paths.clone();
+        let create_new_window = default_open_in_new_window(cx);
+
+        with_active_or_new_workspace(cx, move |workspace, window, cx| {
+            let requesting_window = if create_new_window {
+                None
+            } else {
+                window.window_handle().downcast::<MultiWorkspace>()
+            };
+            let app_state = workspace.app_state().clone();
+            let open_options = OpenOptions {
+                requesting_window,
+                ..Default::default()
+            };
+
+            cx.spawn_in(window, async move |_, cx| {
+                open_remote_project(connection_options, paths, app_state, open_options, cx).await
+            })
+            .detach_and_prompt_err("Failed to open project", window, cx, |_, _, _| None);
+        });
+    });
     cx.on_action(|open_remote: &OpenRemote, cx| {
         let from_existing_connection = open_remote.from_existing_connection;
         let create_new_window = open_remote

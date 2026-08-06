@@ -2315,6 +2315,22 @@ impl DisplaySnapshot {
 
     #[instrument(skip_all)]
     pub fn crease_for_buffer_row(&self, buffer_row: MultiBufferRow) -> Option<Crease<Point>> {
+        self.crease_for_buffer_row_internal(buffer_row, false)
+    }
+
+    #[instrument(skip_all)]
+    pub(crate) fn crease_for_buffer_row_including_folded(
+        &self,
+        buffer_row: MultiBufferRow,
+    ) -> Option<Crease<Point>> {
+        self.crease_for_buffer_row_internal(buffer_row, true)
+    }
+
+    fn crease_for_buffer_row_internal(
+        &self,
+        buffer_row: MultiBufferRow,
+        include_folded: bool,
+    ) -> Option<Crease<Point>> {
         let start =
             MultiBufferPoint::new(buffer_row.0, self.buffer_snapshot().line_len(buffer_row));
         if let Some(crease) = self
@@ -2353,7 +2369,7 @@ impl DisplaySnapshot {
             }
         } else if !self.use_lsp_folding_ranges
             && self.starts_indent(MultiBufferRow(start.row))
-            && !self.is_line_folded(MultiBufferRow(start.row))
+            && (include_folded || !self.is_line_folded(MultiBufferRow(start.row)))
         {
             let start_line_indent = self.line_indent_for_buffer_row(buffer_row);
             let snapshot = self.buffer_snapshot();
@@ -2406,7 +2422,7 @@ impl DisplaySnapshot {
             };
 
             let end = if let Some(row) = closing_row {
-                if let Some(indent_len) = self.closing_bracket_indent_len(row) {
+                if let Some(indent_len) = self.closing_bracket_indent_len(row) && !self.starts_indent(MultiBufferRow(row)) {
                     // Include newline and whitespace before closing delimiter,
                     // so it appears on the same display line as the fold placeholder
                     Point::new(row, indent_len)
