@@ -612,6 +612,46 @@ impl EditorElement {
             register_action(editor, window, Editor::convert_to_rot47);
             register_action(editor, window, Editor::convert_to_base64);
             register_action(editor, window, Editor::convert_from_base64);
+            if editor.read(cx).can_transform_json_document(cx) {
+                register_action(editor, window, |editor, _: &crate::Prettify, window, cx| {
+                    if let Some(task) = editor.format(&crate::Format, window, cx) {
+                        editor.detach_and_notify_err(task, window, cx);
+                    }
+                });
+                register_action(editor, window, |editor, action: &crate::Minify, window, cx| {
+                    if let Err(error) = editor.minify_json(action, window, cx) {
+                        editor.detach_and_notify_err(gpui::Task::ready(Err::<(), _>(error)), window, cx);
+                    }
+                });
+            }
+            if editor.read(cx).can_transform_json_selection(cx) {
+                register_action(
+                    editor,
+                    window,
+                    |editor, action: &crate::StringifySelection, window, cx| {
+                        if let Err(error) = editor.stringify_json_selections(action, window, cx) {
+                            editor.detach_and_notify_err(
+                                gpui::Task::ready(Err::<(), _>(error)),
+                                window,
+                                cx,
+                            );
+                        }
+                    },
+                );
+                register_action(
+                    editor,
+                    window,
+                    |editor, action: &crate::ParseSelection, window, cx| {
+                        if let Err(error) = editor.parse_json_selections(action, window, cx) {
+                            editor.detach_and_notify_err(
+                                gpui::Task::ready(Err::<(), _>(error)),
+                                window,
+                                cx,
+                            );
+                        }
+                    },
+                );
+            }
             register_action(editor, window, Editor::delete_to_previous_word_start);
             register_action(editor, window, Editor::delete_to_previous_subword_start);
             register_action(editor, window, Editor::delete_to_next_word_end);
