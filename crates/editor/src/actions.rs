@@ -406,6 +406,20 @@ actions!(
     ]
 );
 
+actions!(
+    json,
+    [
+        /// Formats the current JSON document for readability.
+        Prettify,
+        /// Removes insignificant whitespace from the current JSON document.
+        Minify,
+        /// Converts each selected range into a JSON string literal.
+        StringifySelection,
+        /// Replaces each selected JSON string literal with its decoded contents.
+        ParseSelection,
+    ]
+);
+
 pub mod guid {
     use gpui::actions;
 
