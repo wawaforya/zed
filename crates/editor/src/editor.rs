@@ -70,6 +70,7 @@ mod markdown_actions;
 mod navigation;
 mod rewrap;
 mod selection;
+mod sequential_guid;
 
 pub(crate) use actions::*;
 pub use clipboard::ClipboardSelection;
@@ -405,6 +406,14 @@ pub fn init(cx: &mut App) {
             |workspace, window, cx| Editor::new_file(workspace, &Default::default(), window, cx),
         )
         .detach_and_log_err(cx);
+    })
+    .on_action(|_: &guid::CopyV4, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string(uuid::Uuid::new_v4().to_string()));
+    })
+    .on_action(|_: &guid::CopySequential, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string(
+            sequential_guid::create().to_string(),
+        ));
     })
     .on_action(move |_: &workspace::NewWindow, cx| {
         let app_state = workspace::AppState::global(cx);
@@ -8878,7 +8887,41 @@ impl Editor {
         self.insert_uuid(UuidVersion::V7, window, cx);
     }
 
+    pub fn insert_guid_v4(
+        &mut self,
+        _: &guid::InsertV4,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.insert_uuid(UuidVersion::V4, window, cx);
+    }
+
+    pub fn insert_sequential_guid(
+        &mut self,
+        _: &guid::InsertSequential,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.insert_guids(sequential_guid::create, window, cx);
+    }
+
     fn insert_uuid(&mut self, version: UuidVersion, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert_guids(
+            || match version {
+                UuidVersion::V4 => uuid::Uuid::new_v4(),
+                UuidVersion::V7 => uuid::Uuid::now_v7(),
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn insert_guids(
+        &mut self,
+        mut create: impl FnMut() -> uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.read_only(cx) {
             return;
         }
@@ -8887,14 +8930,7 @@ impl Editor {
                 .selections
                 .all::<Point>(&this.display_snapshot(cx))
                 .into_iter()
-                .map(|selection| {
-                    let uuid = match version {
-                        UuidVersion::V4 => uuid::Uuid::new_v4(),
-                        UuidVersion::V7 => uuid::Uuid::now_v7(),
-                    };
-
-                    (selection.range(), uuid.to_string())
-                });
+                .map(|selection| (selection.range(), create().to_string()));
             this.edit(edits, cx);
             this.refresh_edit_prediction(
                 true,
