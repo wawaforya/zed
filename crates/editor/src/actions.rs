@@ -406,6 +406,24 @@ actions!(
     ]
 );
 
+pub mod guid {
+    use gpui::actions;
+
+    actions!(
+        guid,
+        [
+            /// Inserts a random GUID at each cursor.
+            InsertV4,
+            /// Copies a random GUID to the clipboard.
+            CopyV4,
+            /// Inserts a sequential GUID at each cursor.
+            InsertSequential,
+            /// Copies a sequential GUID to the clipboard.
+            CopySequential,
+        ]
+    );
+}
+
 actions!(
     editor,
     [
