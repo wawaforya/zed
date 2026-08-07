@@ -644,6 +644,8 @@ impl EditorElement {
             register_action(editor, window, Editor::apply_selected_diff_hunks);
             register_action(editor, window, Editor::insert_uuid_v4);
             register_action(editor, window, Editor::insert_uuid_v7);
+            register_action(editor, window, Editor::insert_guid_v4);
+            register_action(editor, window, Editor::insert_sequential_guid);
             register_action(editor, window, Editor::align_selections);
             if editor.read(cx).enable_wrap_selections_in_tag(cx) {
                 register_action(editor, window, Editor::wrap_selections_in_tag);
