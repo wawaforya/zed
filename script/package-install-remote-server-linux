@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: script/package-install-remote-server-linux [--install-dir <directory>]
+
+Build, package, and install the Linux remote server for the current Zed
+checkout. The default installation directory is ~/.zed_server.
+
+Environment variables:
+  CARGO_TARGET_DIR       Override Cargo's target directory.
+  ZED_RELEASE_CHANNEL    Override crates/zed/RELEASE_CHANNEL.
+  ZED_REMOTE_SERVER_DIR  Override the default installation directory.
+EOF
+}
+
+install_dir="${ZED_REMOTE_SERVER_DIR:-${HOME:?HOME is not set}/.zed_server}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --install-dir)
+            if [[ $# -lt 2 ]]; then
+                echo "error: --install-dir requires a value" >&2
+                exit 1
+            fi
+            install_dir="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "error: unknown argument: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "error: this script must run on Linux" >&2
+    exit 1
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+channel="${ZED_RELEASE_CHANNEL:-$(<crates/zed/RELEASE_CHANNEL)}"
+case "$channel" in
+    stable|preview|nightly|dev) ;;
+    *)
+        echo "error: unsupported release channel: $channel" >&2
+        exit 1
+        ;;
+esac
+
+version="$(
+    awk '
+        /^\[package\]$/ { in_package = 1; next }
+        /^\[/ && in_package { exit }
+        in_package && $1 == "version" {
+            gsub(/"/, "", $3)
+            print $3
+            exit
+        }
+    ' crates/zed/Cargo.toml
+)"
+if [[ -z "$version" ]]; then
+    echo "error: failed to read the Zed version from crates/zed/Cargo.toml" >&2
+    exit 1
+fi
+commit_hash="$(git rev-parse HEAD)"
+
+if [[ "$channel" == "dev" ]]; then
+    remote_server_name="zed-remote-server-dev-build"
+else
+    remote_server_name="zed-remote-server-${channel}-${version}+${channel}.${commit_hash}"
+fi
+
+target_dir="${CARGO_TARGET_DIR:-target}"
+mkdir -p "$target_dir"
+target_dir="$(cd "$target_dir" && pwd)"
+built_binary="${target_dir}/release/remote_server"
+package_path="${target_dir}/release/${remote_server_name}.gz"
+install_path="${install_dir%/}/${remote_server_name}"
+
+if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "warning: the checkout has uncommitted changes; the filename still uses HEAD ${commit_hash}" >&2
+fi
+
+echo "Building remote_server for channel=${channel}, version=${version}, commit=${commit_hash}"
+ZED_RELEASE_CHANNEL="$channel" cargo build --release --package remote_server
+
+if [[ ! -x "$built_binary" ]]; then
+    echo "error: remote_server was not produced at ${built_binary}" >&2
+    exit 1
+fi
+
+mkdir -p "$install_dir"
+staged_binary="$(mktemp "${install_dir%/}/.${remote_server_name}.XXXXXX")"
+staged_package="$(mktemp "${target_dir}/release/.${remote_server_name}.XXXXXX.gz")"
+cleanup() {
+    rm -f "$staged_binary" "$staged_package"
+}
+trap cleanup EXIT
+
+cp "$built_binary" "$staged_binary"
+if command -v llvm-objcopy >/dev/null 2>&1; then
+    llvm-objcopy --strip-debug "$staged_binary"
+else
+    echo "warning: llvm-objcopy not found; installing the unstripped binary" >&2
+fi
+chmod 755 "$staged_binary"
+
+reported_version="$($staged_binary version)"
+case "$channel" in
+    stable|preview)
+        expected_version="$version"
+        ;;
+    nightly|dev)
+        expected_version="$commit_hash"
+        ;;
+esac
+
+if [[ "$reported_version" != "$expected_version" ]]; then
+    echo "error: built server reports version '${reported_version}', expected '${expected_version}'" >&2
+    exit 1
+fi
+
+gzip --best --stdout "$staged_binary" > "$staged_package"
+mv -f "$staged_package" "$package_path"
+mv -f "$staged_binary" "$install_path"
+trap - EXIT
+
+printf 'Package:  %s\n' "$package_path"
+printf 'Installed: %s\n' "$install_path"
+printf 'Version:   %s\n' "$reported_version"
+echo "Disconnect and reconnect the remote project so Zed starts this server binary."
