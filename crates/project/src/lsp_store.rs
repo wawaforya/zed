@@ -11843,15 +11843,30 @@ impl LspStore {
             cx.spawn(async move |lsp_store, cx| {
                 zlog::trace!(logger => "Sending remote format request");
                 let request_timer = zlog::time!(logger => "remote format request");
+                let buffer_ids = buffers
+                    .iter()
+                    .map(|buffer| {
+                        buffer.read_with(cx, |buffer, _| buffer.remote_id().to_proto())
+                    })
+                    .collect();
+                let buffer_languages = buffers
+                    .iter()
+                    .filter_map(|buffer| {
+                        buffer.read_with(cx, |buffer, _| {
+                            Some((
+                                buffer.remote_id().to_proto(),
+                                buffer.language()?.name().as_ref().to_owned(),
+                            ))
+                        })
+                    })
+                    .collect();
                 let result = client
                     .request(proto::FormatBuffers {
                         project_id,
                         trigger: trigger as i32,
-                        buffer_ids: buffers
-                            .iter()
-                            .map(|buffer| buffer.read_with(cx, |buffer, _| buffer.remote_id().to_proto()))
-                            .collect(),
+                        buffer_ids,
                         buffer_ranges,
+                        buffer_languages,
                     })
                     .await
                     .and_then(|result| result.transaction.context("missing transaction"));
@@ -11887,11 +11902,26 @@ impl LspStore {
         mut cx: AsyncApp,
     ) -> Result<proto::FormatBuffersResponse> {
         let sender_id = envelope.original_sender_id().unwrap_or_default();
+        let language_registry = this.read_with(&cx, |this, _| this.languages.clone());
+        let mut buffer_languages = HashMap::default();
+        for (buffer_id, language_name) in &envelope.payload.buffer_languages {
+            let buffer_id = BufferId::new(*buffer_id)?;
+            let language = language_registry
+                .language_for_name(language_name)
+                .await
+                .with_context(|| format!("loading language {language_name:?} for formatting"))?;
+            buffer_languages.insert(buffer_id, language);
+        }
+
         let format = this.update(&mut cx, |this, cx| {
             let mut buffers = HashSet::default();
             for buffer_id in &envelope.payload.buffer_ids {
                 let buffer_id = BufferId::new(*buffer_id)?;
-                buffers.insert(this.buffer_store.read(cx).get_existing(buffer_id)?);
+                let buffer = this.buffer_store.read(cx).get_existing(buffer_id)?;
+                if let Some(language) = buffer_languages.get(&buffer_id) {
+                    this.set_language_for_buffer(&buffer, language.clone(), cx);
+                }
+                buffers.insert(buffer);
             }
 
             let target = if envelope.payload.buffer_ranges.is_empty() {
