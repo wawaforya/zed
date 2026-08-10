@@ -830,6 +830,7 @@ message FormatBuffers {
   FormatTrigger trigger = 2;
   repeated uint64 buffer_ids = 3;
   repeated BufferFormatRanges buffer_ranges = 4;
+  map<uint64, string> buffer_languages = 5;
 }
 
 message FormatBuffersResponse {
