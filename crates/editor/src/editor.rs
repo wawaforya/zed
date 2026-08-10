@@ -8376,6 +8376,60 @@ impl Editor {
         ))
     }
 
+    fn can_trim_trailing_whitespace(&self, cx: &App) -> bool {
+        !self.read_only(cx)
+            && self
+                .buffer
+                .read(cx)
+                .as_singleton()
+                .is_some_and(|buffer| buffer.read(cx).capability().editable())
+    }
+
+    pub fn trim_trailing_whitespace(
+        &mut self,
+        _: &TrimTrailingWhitespace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
+        if !self.can_trim_trailing_whitespace(cx) {
+            return None;
+        }
+
+        let buffer = self.buffer.read(cx).as_singleton()?;
+
+        let trim = buffer.read_with(cx, |buffer, cx| buffer.remove_trailing_whitespace(None, cx));
+
+        Some(cx.spawn_in(window, async move |editor, cx| {
+            let diff = trim.await;
+            editor.update_in(cx, |editor, window, cx| {
+                let is_same_buffer = editor
+                    .buffer
+                    .read(cx)
+                    .as_singleton()
+                    .is_some_and(|current_buffer| current_buffer.entity_id() == buffer.entity_id());
+                if !is_same_buffer
+                    || editor.read_only(cx)
+                    || !buffer.read(cx).capability().editable()
+                {
+                    return;
+                }
+
+                editor
+                    .buffer
+                    .update(cx, |buffer, cx| buffer.finalize_last_transaction(cx));
+                editor.transact(window, cx, |_, _, cx| {
+                    buffer.update(cx, |buffer, cx| {
+                        buffer.apply_diff(diff, cx);
+                    });
+                });
+                editor
+                    .buffer
+                    .update(cx, |buffer, cx| buffer.finalize_last_transaction(cx));
+            })?;
+            Ok(())
+        }))
+    }
+
     fn perform_format(
         &mut self,
         project: Entity<Project>,
