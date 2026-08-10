@@ -610,6 +610,8 @@ actions!(
         /// edits outside the selected ranges are discarded. External command formatters do not
         /// support range formatting and are skipped.
         FormatSelections,
+        /// Removes trailing spaces and tabs from every line in the current document.
+        TrimTrailingWhitespace,
         /// Goes to declaration in a split pane.
         GoToDeclarationSplit,
         /// Goes to definition in a split pane.
