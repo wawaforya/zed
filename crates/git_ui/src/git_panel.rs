@@ -659,7 +659,7 @@ impl StageIntent {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum DiffTarget {
+pub(crate) enum DiffTarget {
     Uncommitted,
     Staged,
     Unstaged,
@@ -2137,8 +2137,9 @@ impl GitPanel {
                 .status_entry()?
                 .clone();
             let repository = self.active_repository.clone()?;
+            let target = Self::diff_target_for_section(self.section_for_entry_index(self.selected_entry?));
 
-            SoloDiffView::open_or_focus(entry, repository, self.workspace.clone(), allow_preview, window, cx)
+            SoloDiffView::open_or_focus(entry, repository, target, self.workspace.clone(), allow_preview, window, cx)
                 .detach_and_notify_err(self.workspace.clone(), window, cx);
 
             Some(())
