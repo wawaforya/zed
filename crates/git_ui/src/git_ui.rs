@@ -358,7 +358,7 @@ fn open_file_diff(
     cx: &mut App,
 ) {
     window.defer(cx, move |window, cx| {
-        SoloDiffView::open_or_focus(entry, repository, workspace.clone(), true, window, cx)
+        SoloDiffView::open_or_focus(entry, repository, crate::git_panel::DiffTarget::Unstaged, workspace.clone(), true, window, cx)
             .detach_and_notify_err(workspace, window, cx);
     });
 }
