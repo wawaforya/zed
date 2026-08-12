@@ -42,7 +42,9 @@ pub struct SoloDiffView {
     repository: Entity<Repository>,
     repository_id: RepositoryId,
     repo_path: RepoPath,
+    target: crate::git_panel::DiffTarget,
     buffer: Entity<Buffer>,
+    display_buffer: Entity<Buffer>,
     diff: Entity<buffer_diff::BufferDiff>,
     editor: Entity<SplittableEditor>,
     workspace: WeakEntity<Workspace>,
@@ -51,9 +53,10 @@ pub struct SoloDiffView {
 }
 
 impl SoloDiffView {
-    pub fn open_or_focus(
+    pub(crate) fn open_or_focus(
         entry: GitStatusEntry,
         repository: Entity<Repository>,
+        target: crate::git_panel::DiffTarget,
         workspace: WeakEntity<Workspace>,
         allow_preview: bool,
         window: &mut Window,
@@ -66,7 +69,7 @@ impl SoloDiffView {
         let existing = workspace_entity
             .read(cx)
             .items_of_type::<SoloDiffView>(cx)
-            .find(|item| item.read(cx).matches(&repository, &entry.repo_path, cx));
+            .find(|item| item.read(cx).matches(&repository, &entry.repo_path, target, cx));
         if let Some(existing) = existing {
             if !allow_preview && let Some(pane) = workspace_entity.read(cx).pane_for(&existing) {
                 pane.update(cx, |pane, _| {
@@ -99,11 +102,32 @@ impl SoloDiffView {
                     project.open_buffer(project_path.clone(), cx)
                 })
                 .await?;
-            let diff = project
-                .update(cx, |project, cx| {
-                    project.open_uncommitted_diff(buffer.clone(), cx)
-                })
-                .await?;
+            let (display_buffer, diff) = match target {
+                crate::git_panel::DiffTarget::Uncommitted => {
+                    let diff = project
+                        .update(cx, |project, cx| {
+                            project.open_uncommitted_diff(buffer.clone(), cx)
+                        })
+                        .await?;
+                    (buffer.clone(), diff)
+                }
+                crate::git_panel::DiffTarget::Unstaged => {
+                    let diff = project
+                        .update(cx, |project, cx| {
+                            project.open_unstaged_diff(buffer.clone(), cx)
+                        })
+                        .await?;
+                    (buffer.clone(), diff)
+                }
+                crate::git_panel::DiffTarget::Staged => {
+                    let (diff, index_buffer) = project
+                        .update(cx, |project, cx| {
+                            project.open_staged_diff(buffer.clone(), cx)
+                        })
+                        .await?;
+                    (index_buffer, diff)
+                }
+            };
 
             workspace_entity.update_in(cx, |workspace, window, cx| {
                 let workspace_handle = cx.entity();
@@ -112,7 +136,9 @@ impl SoloDiffView {
                         project,
                         repository,
                         repo_path,
+                        target,
                         buffer,
+                        display_buffer,
                         diff,
                         workspace_handle,
                         window,
@@ -147,7 +173,9 @@ impl SoloDiffView {
         project: Entity<Project>,
         repository: Entity<Repository>,
         repo_path: RepoPath,
+        target: crate::git_panel::DiffTarget,
         buffer: Entity<Buffer>,
+        display_buffer: Entity<Buffer>,
         diff: Entity<buffer_diff::BufferDiff>,
         workspace: Entity<Workspace>,
         window: &mut Window,
@@ -156,7 +184,7 @@ impl SoloDiffView {
         let repository_id = repository.read(cx).id;
         let showing_full_file = EditorSettings::get_global(cx).file_diff.show_full_file;
         let multibuffer = cx
-            .new(|cx| Self::build_multibuffer(buffer.clone(), diff.clone(), showing_full_file, cx));
+            .new(|cx| Self::build_multibuffer(display_buffer.clone(), diff.clone(), showing_full_file, cx));
         let editor = cx.new(|cx| {
             let editor = SplittableEditor::new(
                 EditorSettings::get_global(cx).diff_view_style,
@@ -166,8 +194,24 @@ impl SoloDiffView {
                 window,
                 cx,
             );
+            match target {
+                crate::git_panel::DiffTarget::Uncommitted => {}
+                crate::git_panel::DiffTarget::Staged => {
+                    editor.set_diff_hunk_delegate(
+                        Some(Arc::new(crate::staged_diff::StagedDiffDelegate)),
+                        cx,
+                    );
+                }
+                crate::git_panel::DiffTarget::Unstaged => {
+                    editor.set_diff_hunk_delegate(
+                        Some(Arc::new(crate::unstaged_diff::UnstagedDiffDelegate)),
+                        cx,
+                    );
+                }
+            }
             editor.rhs_editor().update(cx, |editor, cx| {
                 editor.set_should_serialize(false, cx);
+                editor.set_read_only(target == crate::git_panel::DiffTarget::Staged);
                 editor.set_allow_git_diff_scrollbar_markers(showing_full_file, cx);
                 let snapshot = editor.snapshot(window, cx);
                 editor.go_to_hunk_before_or_after_position(
@@ -201,7 +245,9 @@ impl SoloDiffView {
             repository,
             repository_id,
             repo_path,
+            target,
             buffer,
+            display_buffer,
             diff,
             editor,
             workspace: workspace.downgrade(),
@@ -264,14 +310,14 @@ impl SoloDiffView {
         }
 
         let (ranges, context_line_count) =
-            Self::excerpt_ranges(&self.buffer, &self.diff, showing_full_file, cx);
+            Self::excerpt_ranges(&self.display_buffer, &self.diff, showing_full_file, cx);
 
         self.editor.update(cx, |editor, cx| {
-            let path = PathKey::for_buffer(&self.buffer, cx);
+            let path = PathKey::for_buffer(&self.display_buffer, cx);
             editor.remove_excerpts_for_path(path.clone(), cx);
             editor.update_excerpts_for_path(
                 path,
-                self.buffer.clone(),
+                self.display_buffer.clone(),
                 ranges,
                 context_line_count,
                 self.diff.clone(),
@@ -286,8 +332,8 @@ impl SoloDiffView {
         cx.notify();
     }
 
-    fn matches(&self, repository: &Entity<Repository>, repo_path: &RepoPath, cx: &App) -> bool {
-        self.repository_id == repository.read(cx).id && &self.repo_path == repo_path
+    fn matches(&self, repository: &Entity<Repository>, repo_path: &RepoPath, target: crate::git_panel::DiffTarget, cx: &App) -> bool {
+        self.repository_id == repository.read(cx).id && &self.repo_path == repo_path && self.target == target
     }
 
     fn button_states(&self, cx: &App) -> SoloDiffButtonStates {
@@ -318,7 +364,36 @@ impl SoloDiffView {
 
         let mut stage = false;
         let mut unstage = false;
+        let mut restore = false;
         for hunk in editor.diff_hunks_in_ranges(&ranges, &snapshot) {
+            match self.target {
+                crate::git_panel::DiffTarget::Uncommitted => {
+                    match hunk.status.secondary {
+                        DiffHunkSecondaryStatus::HasSecondaryHunk
+                        | DiffHunkSecondaryStatus::SecondaryHunkAdditionPending => {
+                            stage = true;
+                        }
+                        DiffHunkSecondaryStatus::OverlapsWithSecondaryHunk => {
+                            stage = true;
+                            unstage = true;
+                        }
+                        DiffHunkSecondaryStatus::NoSecondaryHunk
+                        | DiffHunkSecondaryStatus::SecondaryHunkRemovalPending => {
+                            unstage = true;
+                        }
+                    }
+                    restore = true;
+                }
+                crate::git_panel::DiffTarget::Staged => {
+                    unstage = true;
+                }
+                crate::git_panel::DiffTarget::Unstaged => {
+                    stage = true;
+                    restore |= !hunk.is_created_file();
+                }
+            }
+            continue;
+
             match hunk.status.secondary {
                 DiffHunkSecondaryStatus::HasSecondaryHunk
                 | DiffHunkSecondaryStatus::SecondaryHunkAdditionPending => {
@@ -341,15 +416,20 @@ impl SoloDiffView {
             .status_for_path(&self.repo_path)
             .map(|entry| entry.status.staging())
             .unwrap_or(StageStatus::Unstaged);
+        let (stage_file, unstage_file) = match self.target {
+            crate::git_panel::DiffTarget::Uncommitted => (stage_status.has_unstaged(), stage_status.has_staged()),
+            crate::git_panel::DiffTarget::Staged => (false, stage_status.has_staged()),
+            crate::git_panel::DiffTarget::Unstaged => (stage_status.has_unstaged(), false),
+        };
 
         SoloDiffButtonStates {
             stage,
             unstage,
-            restore: stage || unstage,
+            restore,
             prev_next,
             selection,
-            stage_file: stage_status.has_unstaged(),
-            unstage_file: stage_status.has_staged(),
+            stage_file,
+            unstage_file,
         }
     }
 
@@ -850,7 +930,11 @@ impl Render for SoloDiffGitToolbar {
             .repository
             .read(cx)
             .status_for_path(&solo_diff.repo_path);
-        let diff_stat = status_entry.and_then(|entry| entry.diff_stat);
+        let diff_stat = status_entry.and_then(|entry| match solo_diff.target {
+            crate::git_panel::DiffTarget::Uncommitted => entry.diff_stat,
+            crate::git_panel::DiffTarget::Staged => entry.staged_diff_stat,
+            crate::git_panel::DiffTarget::Unstaged => entry.unstaged_diff_stat,
+        });
 
         h_flex()
             .my_neg_1()
