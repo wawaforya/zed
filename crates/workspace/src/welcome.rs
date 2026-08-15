@@ -80,6 +80,7 @@ struct SectionButton {
     action: Box<dyn Action>,
     tab_index: usize,
     focus_handle: FocusHandle,
+    secondary_label: Option<SharedString>,
 }
 
 impl SectionButton {
@@ -96,14 +97,31 @@ impl SectionButton {
             action: action.boxed_clone(),
             tab_index,
             focus_handle,
+            secondary_label: None,
         }
+    }
+
+    fn secondary_label(mut self, label: Option<impl Into<SharedString>>) -> Self {
+        self.secondary_label = label.map(Into::into);
+        self
     }
 }
 
 impl RenderOnce for SectionButton {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let id = format!("onb-button-{}-{}", self.label, self.tab_index);
-        let action_ref: &dyn Action = &*self.action;
+        let secondary_label = self.secondary_label.map(|label| {
+            div()
+                .min_w_0()
+                .max_w_48()
+                .child(
+                    Label::new(label)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+                .into_any_element()
+        });
 
         ButtonLike::new(id)
             .tab_index(self.tab_index as isize)
@@ -118,6 +136,7 @@ impl RenderOnce for SectionButton {
                     .child(
                         h_flex()
                             .min_w_0()
+                            .flex_1()
                             .gap_2()
                             .child(
                                 Icon::new(self.icon)
@@ -126,10 +145,7 @@ impl RenderOnce for SectionButton {
                             )
                             .child(Label::new(self.label).truncate()),
                     )
-                    .child(
-                        KeyBinding::for_action_in(action_ref, &self.focus_handle, cx)
-                            .size(rems_from_px(12_f32)),
-                    ),
+                    .children(secondary_label),
             )
             .on_click(move |_, window, cx| {
                 self.focus_handle.dispatch_action(&*self.action, window, cx)
@@ -431,6 +447,7 @@ impl WelcomePage {
         tab_index: usize,
         location: &SerializedWorkspaceLocation,
         paths: &PathList,
+        ssh_connections: &[settings::SshConnection],
     ) -> impl IntoElement {
         let name = project_name(paths);
 
@@ -448,6 +465,7 @@ impl WelcomePage {
             tab_index,
             self.focus_handle.clone(),
         )
+        .secondary_label(remote_project_name(location, ssh_connections))
     }
 }
 
@@ -458,6 +476,13 @@ impl Render for WelcomePage {
         let mut next_tab_index = first_section_entries + second_section.entries.len();
 
         let ai_enabled = AgentSettings::get_global(cx).enabled(cx);
+        let ssh_connections = cx
+            .global::<settings::SettingsStore>()
+            .merged_settings()
+            .remote
+            .ssh_connections
+            .clone()
+            .unwrap_or_default();
 
         let recent_projects = self
             .recent_workspaces
@@ -472,6 +497,7 @@ impl Render for WelcomePage {
                     first_section_entries + index,
                     &workspace.location,
                     &workspace.identity_paths,
+                    &ssh_connections,
                 )
             })
             .collect::<Vec<_>>();
@@ -704,6 +730,29 @@ fn project_name(paths: &PathList) -> String {
     } else {
         joined
     }
+}
+
+fn remote_project_name(
+    location: &SerializedWorkspaceLocation,
+    ssh_connections: &[settings::SshConnection],
+) -> Option<String> {
+    let SerializedWorkspaceLocation::Remote(connection_options) = location else {
+        return None;
+    };
+    let mut connection_options = connection_options.clone();
+
+    if let remote::RemoteConnectionOptions::Ssh(options) = &mut connection_options {
+        let host = options.host.to_string();
+        if let Some(connection) = ssh_connections.iter().find(|connection| {
+            connection.host == host
+                && connection.username == options.username
+                && connection.port == options.port
+        }) {
+            options.nickname = connection.nickname.clone();
+        }
+    }
+
+    Some(connection_options.display_name())
 }
 
 #[cfg(test)]
