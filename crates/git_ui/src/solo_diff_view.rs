@@ -54,6 +54,7 @@ impl SoloDiffView {
         entry: GitStatusEntry,
         repository: Entity<Repository>,
         workspace: WeakEntity<Workspace>,
+        allow_preview: bool,
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<Entity<Self>>> {
@@ -66,6 +67,11 @@ impl SoloDiffView {
             .items_of_type::<SoloDiffView>(cx)
             .find(|item| item.read(cx).matches(&repository, &entry.repo_path, cx));
         if let Some(existing) = existing {
+            if !allow_preview && let Some(pane) = workspace_entity.read(cx).pane_for(&existing) {
+                pane.update(cx, |pane, _| {
+                    pane.unpreview_item_if_preview(existing.entity_id());
+                });
+            }
             workspace_entity.update(cx, |workspace, cx| {
                 workspace.activate_item(&existing, true, true, window, cx);
             });
@@ -84,6 +90,7 @@ impl SoloDiffView {
         };
 
         let project = workspace_entity.read(cx).project().clone();
+        let pane = workspace_entity.read(cx).active_pane().clone();
         let repo_path = entry.repo_path;
         window.spawn(cx, async move |cx| {
             let buffer = project
@@ -111,6 +118,23 @@ impl SoloDiffView {
                         cx,
                     )
                 });
+
+                pane.update(cx, |pane, cx| {
+                    let destination_index = if allow_preview {
+                        pane.replace_preview_item_id(view.entity_id(), window, cx)
+                    } else {
+                        None
+                    };
+                    pane.add_item(
+                        Box::new(view.clone()),
+                        false,
+                        true,
+                        destination_index,
+                        window,
+                        cx,
+                    );
+                });
+                return view;
 
                 workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
                 view
@@ -384,6 +408,7 @@ impl Item for SoloDiffView {
             } else {
                 Color::Muted
             })
+            .when(params.preview, |label| label.italic())
             .into_any_element()
     }
 

@@ -2017,6 +2017,15 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_solo_diff_with_preview(false, window, cx);
+    }
+
+    fn open_solo_diff_with_preview(
+        &mut self,
+        allow_preview: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         maybe!({
             let entry = self
                 .entries
@@ -2025,7 +2034,7 @@ impl GitPanel {
                 .clone();
             let repository = self.active_repository.clone()?;
 
-            SoloDiffView::open_or_focus(entry, repository, self.workspace.clone(), window, cx)
+            SoloDiffView::open_or_focus(entry, repository, self.workspace.clone(), allow_preview, window, cx)
                 .detach_and_notify_err(self.workspace.clone(), window, cx);
 
             Some(())
@@ -2033,6 +2042,15 @@ impl GitPanel {
     }
 
     fn view_file(&mut self, _: &ViewFile, window: &mut Window, cx: &mut Context<Self>) {
+        self.view_file_with_preview(false, window, cx);
+    }
+
+    fn view_file_with_preview(
+        &mut self,
+        allow_preview: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         maybe!({
             let entry = self.entries.get(self.selected_entry?)?.status_entry()?;
             let project_path = self
@@ -2044,7 +2062,7 @@ impl GitPanel {
             self.workspace
                 .update(cx, |workspace, cx| {
                     workspace
-                        .open_path_preview(project_path, None, false, false, true, window, cx)
+                        .open_path_preview(project_path, None, false, allow_preview, true, window, cx)
                         .detach_and_log_err(cx);
                 })
                 .ok()?;
@@ -2085,6 +2103,13 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if secondary {
+            self.view_file_with_preview(true, window, cx);
+        } else {
+            self.open_solo_diff_with_preview(true, window, cx);
+        }
+        return;
+
         let entry_primary_click_action =
             GitPanelSettings::get_global(cx).entry_primary_click_action;
         let action = match (entry_primary_click_action, secondary) {
