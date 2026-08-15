@@ -141,6 +141,87 @@ impl Render for QuickActionBar {
         let code_action_enabled = editor_value.code_actions_enabled_for_toolbar(cx);
         let focus_handle = editor_value.focus_handle(cx);
 
+        let open_file_diff =
+            (editor.buffer_kind(cx) == ItemBufferKind::Singleton).then(|| {
+                QuickActionBarButton::new(
+                    "open file diff",
+                    IconName::Diff,
+                    false,
+                    Box::new(git::OpenFileDiff),
+                    focus_handle.clone(),
+                    "Open File Diff",
+                    move |_, window, cx| {
+                        window.dispatch_action(Box::new(git::OpenFileDiff), cx);
+                    },
+                )
+            });
+
+        let soft_wrap_button = {
+            let editor = editor.clone();
+            QuickActionBarButton::new(
+                "toggle soft wrap",
+                IconName::TextWrap,
+                false,
+                Box::new(editor::actions::ToggleSoftWrap),
+                focus_handle.clone(),
+                "Toggle Soft Wrap",
+                move |_, window, cx| {
+                    editor.update(cx, |editor, cx| {
+                        editor.toggle_soft_wrap(&editor::actions::ToggleSoftWrap, window, cx)
+                    });
+                },
+            )
+        };
+
+        let fold_all_button = {
+            let editor = editor.clone();
+            QuickActionBarButton::new(
+                "fold all",
+                IconName::FoldVertical,
+                false,
+                Box::new(editor::actions::FoldAll),
+                focus_handle.clone(),
+                "Fold All",
+                move |_, window, cx| {
+                    editor.update(cx, |editor, cx| editor.fold_all(&editor::actions::FoldAll, window, cx));
+                },
+            )
+        };
+
+        let unfold_all_button = {
+            let editor = editor.clone();
+            QuickActionBarButton::new(
+                "unfold all",
+                IconName::ExpandVertical,
+                false,
+                Box::new(editor::actions::UnfoldAll),
+                focus_handle.clone(),
+                "Unfold All",
+                move |_, window, cx| {
+                    editor.update(cx, |editor, cx| editor.unfold_all(&editor::actions::UnfoldAll, window, cx));
+                },
+            )
+        };
+
+        let run_current_file_button =
+            (editor.buffer_kind(cx) == ItemBufferKind::Singleton).then(|| {
+                let action = tasks_ui::Spawn::ByName {
+                    task_name: "Run Current File".to_string(),
+                    reveal_target: None,
+                };
+                QuickActionBarButton::new(
+                    "run current file",
+                    IconName::PlayOutlined,
+                    false,
+                    Box::new(action.clone()),
+                    focus_handle.clone(),
+                    "Run Current File",
+                    move |_, window, cx| {
+                        window.dispatch_action(Box::new(action.clone()), cx);
+                    },
+                )
+            });
+
         let search_button = (editor.buffer_kind(cx) == ItemBufferKind::Singleton).then(|| {
             QuickActionBarButton::new(
                 "toggle buffer search",
@@ -708,6 +789,11 @@ impl Render for QuickActionBar {
             .gap(DynamicSpacing::Base01.rems(cx))
             .children(self.render_repl_menu(cx))
             .children(self.render_preview_button(cx))
+            .children(open_file_diff)
+            .child(soft_wrap_button)
+            .child(fold_all_button)
+            .child(unfold_all_button)
+            .children(run_current_file_button)
             .children(search_button)
             .when(
                 AgentSettings::get_global(cx).enabled(cx) && AgentSettings::get_global(cx).button,
