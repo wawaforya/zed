@@ -15,6 +15,7 @@ use gpui::{
     Action, AnyElement, App, AppContext as _, Context, Empty, Entity, EventEmitter, FocusHandle,
     Focusable, HighlightStyle, IntoElement, Render, Subscription, Task, WeakEntity, Window,
 };
+use language::ToPoint as _;
 use language::{Anchor, Buffer, HighlightedText, OffsetRangeExt as _, Point};
 use multi_buffer::{MultiBuffer, PathKey, excerpt_context_lines};
 use project::{
@@ -358,6 +359,56 @@ impl SoloDiffView {
         cx.defer(move |cx| {
             cx.dispatch_action(action.as_ref());
         });
+    }
+
+    fn open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(project_path) = self
+            .repository
+            .read(cx)
+            .repo_path_to_project_path(&self.repo_path, cx)
+        else {
+            return;
+        };
+
+        let target_position = {
+            let editor = self.editor.read(cx).focused_editor().read(cx);
+            let position = editor.selections.newest_anchor().head();
+            let multibuffer = editor.buffer().read(cx);
+            let snapshot = multibuffer.snapshot(cx);
+            snapshot
+                .anchor_to_buffer_anchor(position)
+                .map(|(anchor, buffer)| anchor.to_point(buffer))
+        };
+
+        let this = cx.entity();
+        let pane = workspace.read(cx).pane_for(&this);
+        let target_pane = pane.as_ref().map(|pane| pane.downgrade());
+        if let Some(pane) = pane {
+            pane.update(cx, |pane, _| {
+                pane.unpreview_item_if_preview(this.entity_id());
+            });
+        }
+
+        let open_task = workspace.update(cx, |workspace, cx| {
+            workspace.open_path_preview(project_path, target_pane, false, true, true, window, cx)
+        });
+        let workspace = self.workspace.clone();
+        window
+            .spawn(cx, async move |cx| {
+                let item = open_task.await?;
+                if let Some(target_position) = target_position
+                    && let Some(editor) = item.downcast::<Editor>()
+                {
+                    editor.update_in(cx, |editor, window, cx| {
+                        editor.go_to_singleton_buffer_point_silently(target_position, window, cx);
+                    })?;
+                }
+                anyhow::Ok(())
+            })
+            .detach_and_notify_err(workspace, window, cx);
     }
 
     fn change_file_stage(&self, stage: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -837,6 +888,30 @@ impl Render for SoloDiffGitToolbar {
                             ))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.dispatch_action(&GoToHunk, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("toggle-soft-wrap", IconName::TextWrap)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::for_action_title_in(
+                                "Toggle Soft Wrap",
+                                &editor::actions::ToggleSoftWrap,
+                                &focus_handle,
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&editor::actions::ToggleSoftWrap, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("open-file", IconName::File)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Open File"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if let Some(solo_diff) = this.solo_diff() {
+                                    solo_diff.update(cx, |solo_diff, cx| {
+                                        solo_diff.open_file(window, cx);
+                                    });
+                                }
                             })),
                     ),
             )
