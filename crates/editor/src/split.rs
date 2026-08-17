@@ -646,6 +646,16 @@ impl SplittableEditor {
         });
     }
 
+    pub fn set_diff_hunk_controls_placement(
+        &self,
+        placement: crate::DiffHunkControlsPlacement,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_editors(cx, |editor, cx| {
+            editor.set_diff_hunk_controls_placement(placement, cx);
+        });
+    }
+
     fn focused_side(&self) -> SplitSide {
         if let Some(lhs) = &self.lhs
             && lhs.was_last_focused
@@ -782,6 +792,7 @@ impl SplittableEditor {
         });
 
         let splittable = cx.weak_entity();
+        let diff_hunk_controls_placement = self.rhs_editor.read(cx).diff_hunk_controls_placement();
         let lhs_editor = cx.new(|cx| {
             let mut editor =
                 Editor::for_multibuffer(lhs_multibuffer.clone(), Some(project.clone()), window, cx);
@@ -791,6 +802,7 @@ impl SplittableEditor {
                 Some(Arc::new(SplitLhsDiffHunkDelegate { splittable })),
                 cx,
             );
+            editor.set_diff_hunk_controls_placement(diff_hunk_controls_placement, cx);
             editor.set_delegate_open_excerpts(true);
             editor.set_show_vertical_scrollbar(false, cx);
             editor.disable_lsp_data();

@@ -209,6 +209,10 @@ impl SoloDiffView {
                     );
                 }
             }
+            editor.set_diff_hunk_controls_placement(
+                editor::DiffHunkControlsPlacement::AvoidCursorOverlap,
+                cx,
+            );
             editor.rhs_editor().update(cx, |editor, cx| {
                 editor.set_should_serialize(false, cx);
                 editor.set_read_only(target == crate::git_panel::DiffTarget::Staged);

@@ -495,6 +495,13 @@ pub enum SizingBehavior {
     SizeByContent,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DiffHunkControlsPlacement {
+    #[default]
+    Overlay,
+    AvoidCursorOverlap,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum EditorMode {
     SingleLine,
@@ -1168,6 +1175,7 @@ pub struct Editor {
     registered_buffers: HashMap<BufferId, OpenLspBufferHandle>,
     load_diff_task: Option<Shared<Task<()>>>,
     diff_hunk_delegate: Option<Arc<dyn DiffHunkDelegate>>,
+    diff_hunk_controls_placement: crate::DiffHunkControlsPlacement,
     selection_mark_mode: bool,
     toggle_fold_multiple_buffers: Task<()>,
     _scroll_cursor_center_top_bottom_task: Task<()>,
@@ -1867,6 +1875,7 @@ impl Editor {
         clone.needs_initial_data_update = self.enable_lsp_data;
         clone.enable_runnables = self.enable_runnables;
         clone.enable_code_lens = self.enable_code_lens;
+        clone.diff_hunk_controls_placement = self.diff_hunk_controls_placement;
         clone
     }
 
@@ -2509,6 +2518,7 @@ impl Editor {
             text_style_refinement: None,
             load_diff_task: None,
             diff_hunk_delegate: None,
+            diff_hunk_controls_placement: crate::DiffHunkControlsPlacement::default(),
             minimap: None,
             change_list: ChangeList::new(),
             mode,
