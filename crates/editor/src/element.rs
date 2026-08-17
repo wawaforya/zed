@@ -4691,9 +4691,12 @@ impl EditorElement {
         &self,
         row_range: Range<DisplayRow>,
         row_infos: &[RowInfo],
+        line_layouts: &[LineWithInvisibles],
         text_hitbox: &Hitbox,
-        newest_cursor_row: Option<DisplayRow>,
+        content_origin: gpui::Point<Pixels>,
+        newest_cursor: Option<DisplayPoint>,
         line_height: Pixels,
+        em_advance: Pixels,
         right_margin: Pixels,
         scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
         sticky_header_height: Pixels,
@@ -4703,14 +4706,23 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (Vec<AnyElement>, Vec<(DisplayRow, Bounds<Pixels>)>) {
-        let diff_hunk_delegate = editor.read(cx).diff_hunk_delegate();
-        let hovered_diff_hunk_row = editor.read(cx).hovered_diff_hunk_row;
+        let (diff_hunk_delegate, placement, hovered_diff_hunk_row) = {
+            let editor = editor.read(cx);
+            (
+                editor.diff_hunk_delegate(),
+                editor.diff_hunk_controls_placement(),
+                editor.hovered_diff_hunk_row,
+            )
+        };
         let sticky_top = text_hitbox.bounds.top() + sticky_header_height;
 
         let mut controls = vec![];
         let mut control_bounds = vec![];
 
-        let active_rows = [hovered_diff_hunk_row, newest_cursor_row];
+        let active_rows = [
+            hovered_diff_hunk_row,
+            newest_cursor.map(|cursor| cursor.row()),
+        ];
 
         for (hunk, _) in display_hunks {
             if let DisplayDiffHunk::Unfolded {
@@ -4758,6 +4770,19 @@ impl EditorElement {
                     .iter()
                     .any(|row| row.is_some_and(|row| display_row_range.contains(&row)))
                 {
+                    let mut element = diff_hunk_delegate.render_hunk_controls(
+                        display_row_range.start.0,
+                        status,
+                        multi_buffer_range.clone(),
+                        *is_created_file,
+                        line_height,
+                        &editor,
+                        window,
+                        cx,
+                    );
+                    let size =
+                        element.layout_as_root(size(px(100.0), line_height).into(), window, cx);
+
                     let hunk_start_y: Pixels = (display_row_range.start.as_f64()
                         * ScrollPixelOffset::from(line_height)
                         + ScrollPixelOffset::from(text_hitbox.bounds.top())
@@ -4775,24 +4800,63 @@ impl EditorElement {
                         sticky_top.min(max_y)
                     };
 
-                    let mut element = diff_hunk_delegate.render_hunk_controls(
-                        display_row_range.start.0,
-                        status,
-                        multi_buffer_range.clone(),
-                        *is_created_file,
-                        line_height,
-                        &editor,
-                        window,
-                        cx,
-                    );
-                    let size =
-                        element.layout_as_root(size(px(100.0), line_height).into(), window, cx);
+                    let right_x = text_hitbox.bounds.right() - right_margin - px(10.) - size.width;
 
-                    let x = text_hitbox.bounds.right() - right_margin - px(10.) - size.width;
-
-                    if x < text_hitbox.bounds.left() {
+                    if right_x < text_hitbox.bounds.left() {
                         continue;
                     }
+
+                    let x = match placement {
+                        crate::DiffHunkControlsPlacement::Overlay => right_x,
+                        crate::DiffHunkControlsPlacement::AvoidCursorOverlap => {
+                            if let Some(cursor) = newest_cursor.filter(|cursor| {
+                                cursor.row() == display_row_range.start
+                                    && row_range.contains(&cursor.row())
+                            }) {
+                                let Some(line_layout) =
+                                    line_layouts.get(cursor.row().minus(row_range.start) as usize)
+                                else {
+                                    continue;
+                                };
+                                let alignment_offset = line_layout.alignment_offset(
+                                    self.style.text.text_align,
+                                    text_hitbox.size.width,
+                                );
+                                let cursor_column = cursor.column() as usize;
+                                let cursor_x = content_origin.x
+                                    + line_layout.x_for_index(cursor_column)
+                                    + alignment_offset
+                                    - Pixels::from(scroll_pixel_position.x);
+                                let cursor_width = (line_layout.x_for_index(cursor_column + 1)
+                                    - line_layout.x_for_index(cursor_column))
+                                .max(em_advance);
+                                let cursor_y: Pixels = (cursor.row().as_f64()
+                                    * ScrollPixelOffset::from(line_height)
+                                    + ScrollPixelOffset::from(text_hitbox.bounds.top())
+                                    - scroll_pixel_position.y)
+                                    .into();
+                                let cursor_gap = px(8.);
+                                let cursor_bounds = Bounds::new(
+                                    gpui::Point::new(cursor_x - cursor_gap, cursor_y),
+                                    gpui::Size::new(cursor_width + cursor_gap * 2., line_height),
+                                );
+                                let right_bounds = Bounds::new(gpui::Point::new(right_x, y), size);
+                                if !cursor_bounds.intersects(&right_bounds) {
+                                    right_x
+                                } else {
+                                    let left_x = text_hitbox.bounds.left() + px(10.);
+                                    let left_bounds =
+                                        Bounds::new(gpui::Point::new(left_x, y), size);
+                                    if cursor_bounds.intersects(&left_bounds) {
+                                        continue;
+                                    }
+                                    left_x
+                                }
+                            } else {
+                                right_x
+                            }
+                        }
+                    };
 
                     let bounds = Bounds::new(gpui::Point::new(x, y), size);
                     control_bounds.push((display_row_range.start, bounds));
@@ -8512,7 +8576,6 @@ impl Element for EditorElement {
                                 None,
                             )
                             .head
-                            .row()
                         })
                     });
 
@@ -8543,7 +8606,7 @@ impl Element for EditorElement {
                     let line_numbers = self.layout_line_numbers(
                         &gutter,
                         &active_rows,
-                        current_selection_head,
+                        current_selection_head.map(|head| head.row()),
                         window,
                         cx,
                     );
@@ -8876,7 +8939,7 @@ impl Element for EditorElement {
                             &gutter_hitbox,
                             &text_hitbox,
                             relative,
-                            current_selection_head,
+                            current_selection_head.map(|head| head.row()),
                             window,
                             cx,
                         )
@@ -9414,9 +9477,12 @@ impl Element for EditorElement {
                             self.layout_diff_hunk_controls(
                                 start_row..end_row,
                                 &row_infos,
+                                &line_layouts,
                                 &text_hitbox,
+                                content_origin,
                                 current_selection_head,
                                 line_height,
+                                em_advance,
                                 right_margin,
                                 scroll_pixel_position,
                                 sticky_header_height,

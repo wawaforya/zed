@@ -622,6 +622,21 @@ impl Editor {
         }
     }
 
+    pub fn diff_hunk_controls_placement(&self) -> crate::DiffHunkControlsPlacement {
+        self.diff_hunk_controls_placement
+    }
+
+    pub fn set_diff_hunk_controls_placement(
+        &mut self,
+        placement: crate::DiffHunkControlsPlacement,
+        cx: &mut Context<Self>,
+    ) {
+        if self.diff_hunk_controls_placement != placement {
+            self.diff_hunk_controls_placement = placement;
+            cx.notify();
+        }
+    }
+
     pub fn git_restore(&mut self, _: &Restore, window: &mut Window, cx: &mut Context<Self>) {
         if self.read_only(cx) {
             return;
