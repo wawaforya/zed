@@ -123,6 +123,10 @@ actions!(
         Close,
         /// Toggles the git panel.
         Toggle,
+        /// Opens the Changes view in the git panel.
+        OpenChanges,
+        /// Opens the History view in the git panel.
+        OpenHistory,
         /// Opens the git panel menu.
         OpenMenu,
         /// Focuses on the commit message editor.
@@ -507,6 +511,22 @@ pub fn register(workspace: &mut Workspace) {
     workspace.register_action(|workspace, _: &Toggle, window, cx| {
         if !workspace.toggle_panel_focus::<GitPanel>(window, cx) {
             workspace.close_panel::<GitPanel>(window, cx);
+        }
+    });
+    workspace.register_action(|workspace, _: &OpenChanges, window, cx| {
+        if let Some(panel) = workspace.panel::<GitPanel>(cx) {
+            panel.update(cx, |panel, cx| {
+                panel.set_active_tab(GitPanelTab::Changes, window, cx)
+            });
+            workspace.focus_panel::<GitPanel>(window, cx);
+        }
+    });
+    workspace.register_action(|workspace, _: &OpenHistory, window, cx| {
+        if let Some(panel) = workspace.panel::<GitPanel>(cx) {
+            panel.update(cx, |panel, cx| {
+                panel.set_active_tab(GitPanelTab::History, window, cx)
+            });
+            workspace.focus_panel::<GitPanel>(window, cx);
         }
     });
     workspace.register_action(|workspace, _: &ExpandCommitEditor, window, cx| {
@@ -6433,77 +6453,6 @@ impl GitPanel {
         )
     }
 
-    fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_tab = self.active_tab;
-
-        let focus_handle = self.focus_handle.clone();
-        let tab = |id: ElementId,
-                   active: bool,
-                   show_changes: bool,
-                   label: SharedString,
-                   set_active_tab: GitPanelTab,
-                   tooltip_action: Box<dyn Action>| {
-            let focus_handle = focus_handle.clone();
-
-            h_flex()
-                .cursor_pointer()
-                .id(id)
-                .h_full()
-                .py_1()
-                .gap_1()
-                .flex_1()
-                .justify_center()
-                .hover(|s| s.bg(cx.theme().colors().element_hover))
-                .border_b_1()
-                .when(!active, |s| {
-                    s.bg(cx.theme().colors().editor_background.opacity(0.6))
-                        .border_color(cx.theme().colors().border.opacity(0.6))
-                })
-                .child(Label::new(label.clone()).when(!active, |this| this.color(Color::Muted)))
-                .when(show_changes && self.changes_count > 0, |this| {
-                    this.child(
-                        Label::new(format!("({})", self.changes_count))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                })
-                .tooltip(Tooltip::for_action_title_in(
-                    format!("Toggle {} Tab", label),
-                    tooltip_action.as_ref(),
-                    &focus_handle,
-                ))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.set_active_tab(set_active_tab, window, cx)
-                }))
-        };
-
-        h_flex()
-            .relative()
-            .h(Tab::container_height(cx))
-            .w_full()
-            .child(tab(
-                ElementId::Name("changes-tab".into()),
-                active_tab == GitPanelTab::Changes,
-                true,
-                "Changes".into(),
-                GitPanelTab::Changes,
-                ActivateChangesTab.boxed_clone(),
-            ))
-            .child(
-                Divider::vertical()
-                    .color(ui::DividerColor::BorderFaded)
-                    .h_full(),
-            )
-            .child(tab(
-                ElementId::Name("history-tab".into()),
-                active_tab != GitPanelTab::Changes,
-                false,
-                "History".into(),
-                GitPanelTab::History,
-                ActivateHistoryTab.boxed_clone(),
-            ))
-    }
-
     fn render_history_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex().flex_1().size_full().overflow_hidden().map(|this| {
             let has_repo = self.active_repository.is_some();
@@ -8514,9 +8463,6 @@ impl Render for GitPanel {
             .child(
                 v_flex()
                     .size_full()
-                    .when(!self.commit_editor_expanded, |this| {
-                        this.child(self.render_tab_bar(cx))
-                    })
                     .map(|this| match self.active_tab {
                         GitPanelTab::Changes => this
                             .children(self.render_changes_header(window, cx))
@@ -8646,6 +8592,37 @@ impl Panel for GitPanel {
         }
         let total = self.changes_count;
         (total > 0).then(|| total.to_string())
+    }
+
+    fn panel_buttons(&self, _: &Window, cx: &App) -> Vec<workspace::dock::PanelButton> {
+        let settings = GitPanelSettings::get_global(cx);
+        if !settings.button {
+            return Vec::new();
+        }
+
+        let changes_label = if settings.show_count_badge && self.changes_count > 0 {
+            Some(self.changes_count.to_string())
+        } else {
+            None
+        };
+
+        vec![
+            workspace::dock::PanelButton::new(
+                "changes",
+                IconName::GitBranch,
+                "Git Changes",
+                OpenChanges.boxed_clone(),
+            )
+            .selected(self.active_tab == GitPanelTab::Changes)
+            .label(changes_label),
+            workspace::dock::PanelButton::new(
+                "history",
+                IconName::HistoryRerun,
+                "Git History",
+                OpenHistory.boxed_clone(),
+            )
+            .selected(self.active_tab == GitPanelTab::History),
+        ]
     }
 
     fn toggle_action(&self) -> Box<dyn Action> {
