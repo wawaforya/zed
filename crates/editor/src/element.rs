@@ -151,9 +151,17 @@ struct SelectionLayout {
 
 struct InlineBlameLayout {
     element: AnyElement,
-    bounds: Bounds<Pixels>,
+    visible_bounds: Bounds<Pixels>,
+    display_row: DisplayRow,
+    is_soft_wrapped: bool,
     buffer_id: BufferId,
     entry: BlameEntry,
+}
+
+enum InlineBlamePlacement {
+    Inline(InlineBlameLayout),
+    StatusBarFallback,
+    Hidden,
 }
 
 impl SelectionLayout {
@@ -2065,10 +2073,12 @@ impl EditorElement {
 
     fn layout_inline_blame(
         &self,
-        display_row: DisplayRow,
-        row_info: &RowInfo,
-        line_layout: &LineWithInvisibles,
-        crease_trailer: Option<&CreaseTrailerLayout>,
+        selection_head: DisplayPoint,
+        editor_snapshot: &EditorSnapshot,
+        visible_rows: Range<DisplayRow>,
+        line_layouts: &[LineWithInvisibles],
+        crease_trailers: &[Option<CreaseTrailerLayout>],
+        text_hitbox: &Hitbox,
         em_width: Pixels,
         content_origin: gpui::Point<Pixels>,
         scroll_position: gpui::Point<ScrollOffset>,
@@ -2076,17 +2086,19 @@ impl EditorElement {
         line_height: Pixels,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<InlineBlameLayout> {
+    ) -> InlineBlamePlacement {
         if !self
             .editor
             .update(cx, |editor, cx| editor.render_git_blame_inline(window, cx))
         {
-            return None;
+            return InlineBlamePlacement::Hidden;
         }
 
         let editor = self.editor.read(cx);
-        let blame = editor.blame.clone()?;
-        let padding = {
+        let Some(blame) = editor.blame.clone() else {
+            return InlineBlamePlacement::Hidden;
+        };
+        let configured_padding = {
             const INLINE_ACCEPT_SUGGESTION_EM_WIDTHS: f32 = 14.;
 
             let mut padding = ProjectSettings::get_global(cx).git.inline_blame.padding as f32;
@@ -2103,19 +2115,53 @@ impl EditorElement {
             padding * em_width
         };
 
-        let (buffer_id, entry) = blame
-            .update(cx, |blame, cx| {
-                blame.blame_for_rows(&[*row_info], cx).next()
-            })
-            .flatten()?;
+        let cursor_point = editor_snapshot.display_point_to_point(selection_head, Bias::Left);
+        let Some((buffer, buffer_point)) = editor_snapshot
+            .buffer_snapshot()
+            .point_to_buffer_point(cursor_point)
+        else {
+            return InlineBlamePlacement::Hidden;
+        };
+        let row_info = RowInfo {
+            buffer_id: Some(buffer.remote_id()),
+            buffer_row: Some(buffer_point.row),
+            ..Default::default()
+        };
+        let Some((buffer_id, entry)) = blame
+            .update(cx, |blame, cx| blame.blame_for_rows(&[row_info], cx).next())
+            .flatten()
+        else {
+            return InlineBlamePlacement::Hidden;
+        };
 
-        let mut element = render_inline_blame_entry(entry.clone(), &self.style, cx)?;
+        let line_start_row = editor_snapshot.prev_line_boundary(cursor_point).1.row();
+        let display_row = editor_snapshot.next_line_boundary(cursor_point).1.row();
+        let is_soft_wrapped = line_start_row != display_row;
+        if !visible_rows.contains(&display_row) {
+            return if is_soft_wrapped {
+                InlineBlamePlacement::StatusBarFallback
+            } else {
+                InlineBlamePlacement::Hidden
+            };
+        }
+
+        let line_index = display_row.minus(visible_rows.start) as usize;
+        let Some(line_layout) = line_layouts.get(line_index) else {
+            return InlineBlamePlacement::Hidden;
+        };
+        let Some(crease_trailer) = crease_trailers.get(line_index) else {
+            return InlineBlamePlacement::Hidden;
+        };
+
+        let Some(mut element) = render_inline_blame_entry(entry.clone(), &self.style, cx) else {
+            return InlineBlamePlacement::Hidden;
+        };
 
         let start_y =
             content_origin.y + line_height * ((display_row.as_f64() - scroll_position.y) as f32);
 
         let start_x = {
-            let line_end = if let Some(crease_trailer) = crease_trailer {
+            let line_end = if let Some(crease_trailer) = crease_trailer.as_ref() {
                 crease_trailer.bounds.right()
             } else {
                 Pixels::from(
@@ -2124,6 +2170,15 @@ impl EditorElement {
                 )
             };
 
+            let padding = if is_soft_wrapped {
+                let maximum_padding = cmp::max(
+                    text_hitbox.bounds.right() - line_end - em_width,
+                    Pixels::ZERO,
+                );
+                cmp::min(configured_padding, maximum_padding)
+            } else {
+                configured_padding
+            };
             let padded_line_end = line_end + padding;
 
             let min_column_in_pixels = column_pixels(
@@ -2142,12 +2197,19 @@ impl EditorElement {
         let absolute_offset = point(start_x, start_y);
         let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
         let bounds = Bounds::new(absolute_offset, size);
+        let visible_bounds = bounds.intersect(&text_hitbox.bounds);
+
+        if is_soft_wrapped && visible_bounds.size.width < em_width {
+            return InlineBlamePlacement::StatusBarFallback;
+        }
 
         element.prepaint_as_root(absolute_offset, AvailableSpace::min_size(), window, cx);
 
-        Some(InlineBlameLayout {
+        InlineBlamePlacement::Inline(InlineBlameLayout {
             element,
-            bounds,
+            visible_bounds,
+            display_row,
+            is_soft_wrapped,
             buffer_id,
             entry,
         })
@@ -9024,6 +9086,7 @@ impl Element for EditorElement {
                     );
 
                     let mut inline_blame_layout = None;
+                    let mut inline_blame_status_bar_fallback = None;
                     let mut inline_code_actions = None;
                     if let Some(newest_selection_head) = newest_selection_head {
                         let display_row = newest_selection_head.row();
@@ -9041,42 +9104,46 @@ impl Element for EditorElement {
                                 cx,
                             );
 
-                            let line_ix = display_row.minus(start_row) as usize;
-                            if let (Some(row_info), Some(line_layout), Some(crease_trailer)) = (
-                                row_infos.get(line_ix),
-                                line_layouts.get(line_ix),
-                                crease_trailers.get(line_ix),
+                            match self.layout_inline_blame(
+                                newest_selection_head,
+                                &snapshot,
+                                start_row..end_row,
+                                &line_layouts,
+                                &crease_trailers,
+                                &text_hitbox,
+                                em_width,
+                                content_origin,
+                                scroll_position,
+                                scroll_pixel_position,
+                                line_height,
+                                window,
+                                cx,
                             ) {
-                                let crease_trailer_layout = crease_trailer.as_ref();
-                                if let Some(layout) = self.layout_inline_blame(
-                                    display_row,
-                                    row_info,
-                                    line_layout,
-                                    crease_trailer_layout,
-                                    em_width,
-                                    content_origin,
-                                    scroll_position,
-                                    scroll_pixel_position,
-                                    line_height,
-                                    window,
-                                    cx,
-                                ) {
+                                InlineBlamePlacement::Inline(layout) => {
+                                    let blame_display_row = layout.display_row;
+                                    if layout.is_soft_wrapped {
+                                        inline_blame_status_bar_fallback = Some(false);
+                                    }
                                     inline_blame_layout = Some(layout);
                                     // Blame overrides inline diagnostics
-                                    inline_diagnostics.remove(&display_row);
+                                    inline_diagnostics.remove(&blame_display_row);
                                 }
-                            } else {
-                                log::error!(
-                                    "bug: line_ix {} is out of bounds - row_infos.len(): {}, \
-                                    line_layouts.len(): {}, \
-                                    crease_trailers.len(): {}",
-                                    line_ix,
-                                    row_infos.len(),
-                                    line_layouts.len(),
-                                    crease_trailers.len(),
-                                );
+                                InlineBlamePlacement::StatusBarFallback => {
+                                    inline_blame_status_bar_fallback = Some(true);
+                                }
+                                InlineBlamePlacement::Hidden => {}
                             }
                         }
+                    }
+
+                    if let Some(inline_blame_status_bar_fallback) = inline_blame_status_bar_fallback
+                    {
+                        self.editor.update(cx, |editor, cx| {
+                            editor.set_inline_blame_status_bar_fallback(
+                                inline_blame_status_bar_fallback,
+                                cx,
+                            );
+                        });
                     }
 
                     let blamed_display_rows = self.layout_blame_entries(
@@ -9513,9 +9580,13 @@ impl Element for EditorElement {
                         content_width: text_hitbox.size.width,
                         gutter_hitbox: gutter_hitbox.clone(),
                         text_hitbox: text_hitbox.clone(),
-                        inline_blame_bounds: inline_blame_layout
-                            .as_ref()
-                            .map(|layout| (layout.bounds, layout.buffer_id, layout.entry.clone())),
+                        inline_blame_bounds: inline_blame_layout.as_ref().map(|layout| {
+                            (
+                                layout.visible_bounds,
+                                layout.buffer_id,
+                                layout.entry.clone(),
+                            )
+                        }),
                         display_hunks: display_hunks.clone(),
                         diff_hunk_control_bounds,
                     });
@@ -11138,7 +11209,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_status_bar_blame_location_reserves_no_scroll_width(cx: &mut TestAppContext) {
+    async fn test_inline_blame_placement(cx: &mut TestAppContext) {
         struct FixedWidthBlameRenderer;
 
         impl BlameRenderer for FixedWidthBlameRenderer {
@@ -11324,6 +11395,83 @@ mod tests {
             state.position_map.scroll_max.x < scroll_max_with_inline_blame,
             "Blame in the status bar should not reserve horizontal scroll room"
         );
+
+        cx.update(|_, cx| {
+            cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .git
+                        .get_or_insert_default()
+                        .inline_blame
+                        .get_or_insert_default()
+                        .location = Some(settings::InlineBlameLocation::Inline);
+                });
+            });
+        });
+        window
+            .update(cx, |editor, window, cx| {
+                editor.set_soft_wrap_mode(language_settings::SoftWrap::EditorWidth, cx);
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections.select_ranges([Point::new(0, 100)..Point::new(0, 100)]);
+                });
+            })
+            .unwrap();
+
+        let (_, state) = cx.draw(Default::default(), size(px(226.), px(500.)), |_, _| {
+            EditorElement::new(&editor, style.clone())
+        });
+        let last_display_row = state.position_map.snapshot.max_point().row();
+        assert!(
+            last_display_row > DisplayRow(0),
+            "the line should soft-wrap"
+        );
+        let (blame_bounds, ..) = state
+            .position_map
+            .inline_blame_bounds
+            .as_ref()
+            .expect("inline blame should be visible at the end of the wrapped line");
+        let expected_y = state.position_map.text_hitbox.bounds.origin.y
+            + state.position_map.line_height
+                * ((last_display_row.as_f64() - state.position_map.scroll_position.y) as f32);
+        assert_eq!(blame_bounds.origin.y, expected_y);
+        assert!(blame_bounds.size.width >= state.position_map.em_layout_width);
+        assert!(!editor.update(cx, |editor, _| editor.inline_blame_status_bar_fallback()));
+
+        cx.update(|_, cx| {
+            cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .git
+                        .get_or_insert_default()
+                        .inline_blame
+                        .get_or_insert_default()
+                        .min_column = Some(1_000);
+                });
+            });
+        });
+        let (_, state) = cx.draw(Default::default(), size(px(226.), px(500.)), |_, _| {
+            EditorElement::new(&editor, style.clone())
+        });
+        assert!(state.position_map.inline_blame_bounds.is_none());
+        assert!(editor.update(cx, |editor, _| editor.inline_blame_status_bar_fallback()));
+
+        cx.update(|_, cx| {
+            cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .git
+                        .get_or_insert_default()
+                        .inline_blame
+                        .get_or_insert_default()
+                        .min_column = Some(0);
+                });
+            });
+        });
+        let (_, state) = cx.draw(Default::default(), size(px(226.), px(500.)), |_, _| {
+            EditorElement::new(&editor, style.clone())
+        });
+        assert!(state.position_map.inline_blame_bounds.is_some());
+        assert!(!editor.update(cx, |editor, _| editor.inline_blame_status_bar_fallback()));
     }
 
     #[gpui::test]
