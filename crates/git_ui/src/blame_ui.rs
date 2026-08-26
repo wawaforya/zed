@@ -65,20 +65,19 @@ pub struct GitBlameStatus {
 impl GitBlameStatus {
     fn update(&mut self, editor: Entity<Editor>, _window: &mut Window, cx: &mut Context<Self>) {
         let inline_blame = ProjectSettings::get_global(cx).git.inline_blame;
-        let text =
-            if inline_blame.enabled && inline_blame.location == InlineBlameLocation::StatusBar {
-                editor
-                    .update(cx, |editor, cx| editor.active_git_blame_entry(cx))
-                    .map(|blame_entry| {
-                        (
-                            format_blame_text(&blame_entry, inline_blame.date_style, cx).into(),
-                            format_blame_text(&blame_entry, settings::GitDateStyle::Absolute, cx)
-                                .into(),
-                        )
-                    })
-            } else {
-                None
-            };
+        let text = if inline_blame.enabled {
+            editor
+                .update(cx, |editor, cx| editor.active_git_blame_entry(cx))
+                .map(|blame_entry| {
+                    (
+                        format_blame_text(&blame_entry, inline_blame.date_style, cx).into(),
+                        format_blame_text(&blame_entry, settings::GitDateStyle::Absolute, cx)
+                            .into(),
+                    )
+                })
+        } else {
+            None
+        };
 
         if text != self.text {
             self.text = text;
@@ -90,7 +89,12 @@ impl GitBlameStatus {
 impl Render for GitBlameStatus {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let inline_blame = ProjectSettings::get_global(cx).git.inline_blame;
-        if !inline_blame.enabled || inline_blame.location != InlineBlameLocation::StatusBar {
+        let show_in_status_bar = inline_blame.location == InlineBlameLocation::StatusBar
+            || self
+                .active_editor
+                .as_ref()
+                .is_some_and(|editor| editor.read(cx).inline_blame_status_bar_fallback());
+        if !inline_blame.enabled || !show_in_status_bar {
             return div();
         }
 
