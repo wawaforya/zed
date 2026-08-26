@@ -550,6 +550,21 @@ impl Editor {
             .map(|(_, entry)| entry)
     }
 
+    pub fn inline_blame_status_bar_fallback(&self) -> bool {
+        self.inline_blame_status_bar_fallback
+    }
+
+    pub(super) fn set_inline_blame_status_bar_fallback(
+        &mut self,
+        fallback: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.inline_blame_status_bar_fallback != fallback {
+            self.inline_blame_status_bar_fallback = fallback;
+            cx.notify();
+        }
+    }
+
     pub fn show_git_blame_gutter(&self) -> bool {
         self.show_git_blame_gutter
     }
@@ -2000,8 +2015,9 @@ impl Editor {
     }
 
     pub(super) fn render_git_blame_inline(&self, window: &Window, cx: &App) -> bool {
-        ProjectSettings::get_global(cx).git.inline_blame.location
-            == project::project_settings::InlineBlameLocation::Inline
+        !self.mode().is_minimap()
+            && ProjectSettings::get_global(cx).git.inline_blame.location
+                == project::project_settings::InlineBlameLocation::Inline
             && self.show_git_blame_inline
             && (self.focus_handle.is_focused(window) || self.inline_blame_popover.is_some())
             && !self.newest_selection_head_on_empty_line(cx)
@@ -2009,6 +2025,7 @@ impl Editor {
     }
 
     pub(super) fn start_inline_blame_timer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.inline_blame_status_bar_fallback = false;
         if let Some(delay) = ProjectSettings::get_global(cx).git.inline_blame_delay() {
             self.show_git_blame_inline = false;
 
