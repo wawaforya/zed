@@ -6468,12 +6468,12 @@ impl GitPanel {
                                 .tooltip(|_window, cx| {
                                     Tooltip::for_action(
                                         "Open Git Graph",
-                                        &crate::git_graph::Open,
+                                        &zed_actions::git_graph::Open,
                                         cx,
                                     )
                                 })
                                 .on_click(|_, window, cx| {
-                                    window.dispatch_action(crate::git_graph::Open.boxed_clone(), cx)
+                                    window.dispatch_action(zed_actions::git_graph::Open.boxed_clone(), cx)
                                 }),
                         ),
                 ),

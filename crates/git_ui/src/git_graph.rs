@@ -575,8 +575,6 @@ impl SplitState {
 actions!(
     git_graph,
     [
-        /// Opens the Git Graph Tab.
-        Open,
         /// Focuses the search field.
         FocusSearch,
         /// Focuses the next git graph tab stop.
@@ -1083,7 +1081,7 @@ pub fn init(cx: &mut App) {
 
                     div.on_action({
                         let workspace = workspace.clone();
-                        move |_: &Open, window, cx| {
+                        move |_: &zed_actions::git_graph::Open, window, cx| {
                             workspace
                                 .update(cx, |workspace, cx| {
                                     let Some(repo) =

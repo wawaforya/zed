@@ -378,6 +378,16 @@ pub mod git {
     );
 }
 
+pub mod git_graph {
+    gpui::actions!(
+        git_graph,
+        [
+            /// Opens the Git Graph Tab.
+            Open
+        ]
+    );
+}
+
 pub mod toast {
     use gpui::actions;
 
