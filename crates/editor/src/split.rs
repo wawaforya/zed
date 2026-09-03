@@ -598,6 +598,7 @@ pub struct SplittableEditor {
     /// mode, regardless of the current diff view style setting.
     too_narrow_for_split: bool,
     last_width: Option<Pixels>,
+    should_serialize: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -653,6 +654,13 @@ impl SplittableEditor {
     ) {
         self.update_editors(cx, |editor, cx| {
             editor.set_diff_hunk_controls_placement(placement, cx);
+        });
+    }
+
+    pub fn set_should_serialize(&mut self, should_serialize: bool, cx: &mut Context<Self>) {
+        self.should_serialize = should_serialize;
+        self.update_editors(cx, |editor, cx| {
+            editor.set_should_serialize(should_serialize, cx);
         });
     }
 
@@ -763,6 +771,7 @@ impl SplittableEditor {
             searched_side: None,
             too_narrow_for_split: false,
             last_width: None,
+            should_serialize: true,
             _subscriptions: subscriptions,
         }
     }
@@ -793,6 +802,7 @@ impl SplittableEditor {
 
         let splittable = cx.weak_entity();
         let diff_hunk_controls_placement = self.rhs_editor.read(cx).diff_hunk_controls_placement();
+        let should_serialize = self.should_serialize;
         let lhs_editor = cx.new(|cx| {
             let mut editor =
                 Editor::for_multibuffer(lhs_multibuffer.clone(), Some(project.clone()), window, cx);
@@ -809,6 +819,7 @@ impl SplittableEditor {
             editor.disable_runnables();
             editor.disable_diagnostics(cx);
             editor.disable_mouse_wheel_zoom();
+            editor.set_should_serialize(should_serialize, cx);
             editor.set_minimap_visibility(crate::MinimapVisibility::Disabled, window, cx);
             editor
         });

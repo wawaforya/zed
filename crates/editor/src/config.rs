@@ -138,6 +138,31 @@ impl Editor {
         }
     }
 
+    pub fn set_allow_minimap_for_multibuffer(
+        &mut self,
+        allow: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.allow_minimap_for_multibuffer == allow {
+            return;
+        }
+
+        self.allow_minimap_for_multibuffer = allow;
+        if allow {
+            self.set_minimap_visibility(MinimapVisibility::for_mode(self.mode(), cx), window, cx);
+            if self.minimap_visibility.visible() && self.minimap.is_none() {
+                let minimap_settings = EditorSettings::get_global(cx).minimap;
+                self.minimap =
+                    self.create_minimap(minimap_settings.with_show_override(), window, cx);
+            }
+        } else if self.buffer_kind(cx) != ItemBufferKind::Singleton {
+            self.set_minimap_visibility(MinimapVisibility::Disabled, window, cx);
+            self.minimap = None;
+        }
+        cx.notify();
+    }
+
     pub fn breadcrumbs_visible(&self) -> bool {
         self.breadcrumbs_visibility.visible()
     }

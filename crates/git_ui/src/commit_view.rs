@@ -218,6 +218,8 @@ impl CommitView {
                             CommitView::new(
                                 commit_details,
                                 commit_diff,
+                                false,
+                                true,
                                 repo,
                                 project.clone(),
                                 workspace_entity,
@@ -261,9 +263,11 @@ impl CommitView {
             .detach();
     }
 
-    fn new(
+    pub(crate) fn new(
         commit: CommitDetails,
         commit_diff: CommitDiff,
+        showing_all_diff_lines: bool,
+        show_file_headers: bool,
         repository: Entity<Repository>,
         project: Entity<Project>,
         workspace_entity: Entity<Workspace>,
@@ -274,7 +278,11 @@ impl CommitView {
     ) -> Self {
         let language_registry = project.read(cx).languages().clone();
         let multibuffer = cx.new(|cx| {
-            let mut multibuffer = MultiBuffer::new(Capability::ReadOnly);
+            let mut multibuffer = if show_file_headers {
+                MultiBuffer::new(Capability::ReadOnly)
+            } else {
+                MultiBuffer::without_headers(Capability::ReadOnly)
+            };
             multibuffer.set_all_diff_hunks_expanded(cx);
             multibuffer
         });
@@ -289,7 +297,7 @@ impl CommitView {
         });
 
         let editor = cx.new(|cx| {
-            let editor = SplittableEditor::new(
+            let mut editor = SplittableEditor::new(
                 EditorSettings::get_global(cx).diff_view_style,
                 multibuffer.clone(),
                 project.clone(),
@@ -298,6 +306,9 @@ impl CommitView {
                 cx,
             );
             editor.set_diff_hunk_delegate(Some(Arc::new(RestoreOnlyDiffHunkDelegate)), cx);
+            if !show_file_headers {
+                editor.set_should_serialize(false, cx);
+            }
 
             editor.rhs_editor().update(cx, |editor, cx| {
                 editor.set_show_bookmarks(false, cx);
@@ -397,26 +408,26 @@ impl CommitView {
                     build_buffer_diff(old_text, &buffer, &language_registry, cx).await?
                 };
 
-                let (excerpt_ranges, path) = cx.update(|_, cx| {
+                let (excerpt_ranges, path, context_line_count) = cx.update(|_, cx| {
                     let snapshot = buffer.read(cx).snapshot();
                     let path = PathKey::with_sort_prefix(
                         FILE_NAMESPACE_SORT_PREFIX,
                         snapshot.file().unwrap().path().clone(),
                     );
-                    let ranges = if is_binary {
+                    if showing_all_diff_lines {
+                        return (vec![language::Point::zero()..snapshot.max_point()], path, 0);
+                    }
+
+                    let diff_snapshot = buffer_diff.read(cx).snapshot(cx);
+                    let mut hunks = diff_snapshot.hunks(&snapshot).peekable();
+                    let ranges = if is_binary || hunks.peek().is_none() {
                         vec![language::Point::zero()..snapshot.max_point()]
                     } else {
-                        let diff_snapshot = buffer_diff.read(cx).snapshot(cx);
-                        let mut hunks = diff_snapshot.hunks(&snapshot).peekable();
-                        if hunks.peek().is_none() {
-                            vec![language::Point::zero()..snapshot.max_point()]
-                        } else {
-                            hunks
-                                .map(|hunk| hunk.buffer_range.to_point(&snapshot))
-                                .collect::<Vec<_>>()
-                        }
+                        hunks
+                            .map(|hunk| hunk.buffer_range.to_point(&snapshot))
+                            .collect::<Vec<_>>()
                     };
-                    (ranges, path)
+                    (ranges, path, multibuffer_context_lines(cx))
                 })?;
 
                 // Batch the insertion of excerpts and yield between batches, to avoid blocking the main thread when a single file has many hunks.
@@ -433,12 +444,20 @@ impl CommitView {
                                 path.clone(),
                                 buffer.clone(),
                                 ranges,
-                                multibuffer_context_lines(cx),
+                                context_line_count,
                                 buffer_diff.clone(),
                                 cx,
                             );
-                            if is_first_batch && editor.diff_view_style() == DiffViewStyle::Split {
-                                editor.split(window, cx);
+                            if is_first_batch {
+                                if editor.diff_view_style() == DiffViewStyle::Split {
+                                    editor.split(window, cx);
+                                }
+                                if showing_all_diff_lines {
+                                    editor.rhs_editor().update(cx, |editor, cx| {
+                                        editor.set_allow_git_diff_scrollbar_markers(true, cx);
+                                        editor.set_allow_minimap_for_multibuffer(true, window, cx);
+                                    });
+                                }
                             }
                         });
                     })?;
@@ -498,6 +517,35 @@ impl CommitView {
             workspace,
             remote,
             _load_diff_task: load_diff_task,
+        }
+    }
+
+    pub(crate) fn editor(&self) -> Entity<SplittableEditor> {
+        self.editor.clone()
+    }
+
+    pub(crate) fn go_to_previous_hunk(&self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.editor.focus_handle(cx), cx);
+        window.dispatch_action(Box::new(editor::actions::GoToPreviousHunk), cx);
+    }
+
+    pub(crate) fn go_to_next_hunk(&self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.editor.focus_handle(cx), cx);
+        window.dispatch_action(Box::new(editor::actions::GoToHunk), cx);
+    }
+
+    pub(crate) fn toggle_soft_wrap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (rhs, lhs) = {
+            let editor = self.editor.read(cx);
+            (editor.rhs_editor().clone(), editor.lhs_editor().cloned())
+        };
+        rhs.update(cx, |editor, cx| {
+            editor.toggle_soft_wrap(&editor::actions::ToggleSoftWrap, window, cx);
+        });
+        if let Some(lhs) = lhs {
+            lhs.update(cx, |editor, cx| {
+                editor.toggle_soft_wrap(&editor::actions::ToggleSoftWrap, window, cx);
+            });
         }
     }
 

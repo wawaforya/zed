@@ -1016,6 +1016,7 @@ pub struct Editor {
     show_gutter: bool,
     show_scrollbars: ScrollbarAxes,
     minimap_visibility: MinimapVisibility,
+    allow_minimap_for_multibuffer: bool,
     offset_content: bool,
     disable_expand_excerpt_buttons: bool,
     delegate_expand_excerpts: bool,
@@ -2375,6 +2376,7 @@ impl Editor {
             navigation_overlays: HashMap::default(),
             gutter_highlights: Default::default(),
             allow_git_diff_scrollbar_markers: false,
+            allow_minimap_for_multibuffer: false,
             scrollbar_marker_state: ScrollbarMarkerState::default(),
             active_indent_guides_state: ActiveIndentGuidesState::default(),
             nav_history: None,
@@ -8541,8 +8543,12 @@ impl Editor {
         window.show_character_palette();
     }
 
+    fn supports_minimap_buffer(&self, cx: &App) -> bool {
+        self.buffer_kind(cx) == ItemBufferKind::Singleton || self.allow_minimap_for_multibuffer
+    }
+
     pub fn supports_minimap(&self, cx: &App) -> bool {
-        !self.minimap_visibility.disabled() && self.buffer_kind(cx) == ItemBufferKind::Singleton
+        !self.minimap_visibility.disabled() && self.supports_minimap_buffer(cx)
     }
 
     pub fn toggle_minimap(
@@ -8777,7 +8783,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<Self>> {
-        (minimap_settings.minimap_enabled() && self.buffer_kind(cx) == ItemBufferKind::Singleton)
+        (minimap_settings.minimap_enabled() && self.supports_minimap_buffer(cx))
             .then(|| self.initialize_new_minimap(minimap_settings, window, cx))
     }
 
