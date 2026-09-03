@@ -1050,7 +1050,30 @@ pub fn init(cx: &mut App) {
 
     cx.observe_new(|workspace: &mut workspace::Workspace, _, _| {
         workspace.register_action_renderer(|div, workspace, window, cx| {
-            div.when_some(
+            let workspace_for_path = workspace.weak_handle();
+            div.on_action(
+                move |action: &workspace::OpenFileHistoryForPath, window, cx| {
+                    let project_path = action.0.clone();
+                    workspace_for_path
+                        .update(cx, |workspace, cx| {
+                            let Some((repo_id, log_source)) =
+                                resolve_file_history_target_from_project_path(
+                                    workspace,
+                                    &project_path,
+                                    cx,
+                                )
+                            else {
+                                return;
+                            };
+                            let git_store = workspace.project().read(cx).git_store().clone();
+                            open_or_reuse_graph(
+                                workspace, repo_id, git_store, log_source, None, window, cx,
+                            );
+                        })
+                        .ok();
+                },
+            )
+            .when_some(
                 resolve_file_history_target(workspace, window, cx),
                 |div, (repo_id, log_source)| {
                     let git_store = workspace.project().read(cx).git_store().clone();
@@ -5837,6 +5860,23 @@ mod tests {
             assert_eq!(
                 latest.read(cx).log_source,
                 LogSource::Path(tracked2_repo_path)
+            );
+        });
+
+        workspace_window
+            .update(cx, |_, window, cx| {
+                window.dispatch_action(Box::new(workspace::OpenFileHistoryForPath(tracked1)), cx);
+            })
+            .expect("workspace window should be available");
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            let graph = workspace
+                .active_item_as::<GitGraph>(cx)
+                .expect("file history action should activate a git graph");
+            assert_eq!(
+                graph.read(cx).log_source,
+                LogSource::Path(tracked1_repo_path)
             );
         });
     }

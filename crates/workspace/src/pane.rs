@@ -187,6 +187,10 @@ pub struct RevealInProjectPanel {
     pub entry_id: Option<u64>,
 }
 
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = pane, no_json)]
+pub struct OpenFileHistoryForPath(pub ProjectPath);
+
 /// Opens the search interface with the specified configuration.
 #[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Default, Action)]
 #[action(namespace = pane)]
@@ -3136,101 +3140,120 @@ impl Pane {
                         close_pinned: false,
                     };
                     if let Some(pane) = pane.upgrade() {
-                        menu = menu
-                            .entry(
-                                "Close",
-                                Some(Box::new(close_active_item_action)),
-                                window.handler_for(&pane, move |pane, window, cx| {
-                                    pane.close_item_by_id(item_id, SaveIntent::Close, window, cx)
-                                        .detach_and_log_err(cx);
-                                }),
-                            )
-                            .item(ContextMenuItem::Entry(
-                                ContextMenuEntry::new("Close Others")
-                                    .action(Box::new(close_inactive_items_action.clone()))
-                                    .disabled(total_items == 1)
-                                    .handler(window.handler_for(&pane, move |pane, window, cx| {
-                                        pane.close_other_items(
-                                            &close_inactive_items_action,
-                                            Some(item_id),
+                        if single_entry_to_resolve.is_none() {
+                            menu = menu
+                                .entry(
+                                    "Close",
+                                    Some(Box::new(close_active_item_action)),
+                                    window.handler_for(&pane, move |pane, window, cx| {
+                                        pane.close_item_by_id(
+                                            item_id,
+                                            SaveIntent::Close,
                                             window,
                                             cx,
                                         )
                                         .detach_and_log_err(cx);
-                                    })),
-                            ))
-                            // We make this optional, instead of using disabled as to not overwhelm the context menu unnecessarily
-                            .extend(has_multibuffer_items.then(|| {
-                                ContextMenuItem::Entry(
-                                    ContextMenuEntry::new("Close Multibuffers")
-                                        .action(Box::new(close_multibuffers_action.clone()))
+                                    }),
+                                )
+                                .item(ContextMenuItem::Entry(
+                                    ContextMenuEntry::new("Close Others")
+                                        .action(Box::new(close_inactive_items_action.clone()))
+                                        .disabled(total_items == 1)
                                         .handler(window.handler_for(
                                             &pane,
                                             move |pane, window, cx| {
-                                                pane.close_multibuffer_items(
-                                                    &close_multibuffers_action,
+                                                pane.close_other_items(
+                                                    &close_inactive_items_action,
+                                                    Some(item_id),
                                                     window,
                                                     cx,
                                                 )
                                                 .detach_and_log_err(cx);
                                             },
                                         )),
-                                )
-                            }))
-                            .separator()
-                            .item(ContextMenuItem::Entry(
-                                ContextMenuEntry::new("Close Left")
-                                    .action(Box::new(close_items_to_the_left_action.clone()))
-                                    .disabled(!has_items_to_left)
-                                    .handler(window.handler_for(&pane, move |pane, window, cx| {
-                                        pane.close_items_to_the_left_by_id(
-                                            Some(item_id),
-                                            &close_items_to_the_left_action,
-                                            window,
-                                            cx,
-                                        )
-                                        .detach_and_log_err(cx);
-                                    })),
-                            ))
-                            .item(ContextMenuItem::Entry(
-                                ContextMenuEntry::new("Close Right")
-                                    .action(Box::new(close_items_to_the_right_action.clone()))
-                                    .disabled(!has_items_to_right)
-                                    .handler(window.handler_for(&pane, move |pane, window, cx| {
-                                        pane.close_items_to_the_right_by_id(
-                                            Some(item_id),
-                                            &close_items_to_the_right_action,
-                                            window,
-                                            cx,
-                                        )
-                                        .detach_and_log_err(cx);
-                                    })),
-                            ))
-                            .separator()
-                            .item(ContextMenuItem::Entry(
-                                ContextMenuEntry::new("Close Clean")
-                                    .action(Box::new(close_clean_items_action.clone()))
-                                    .disabled(!has_clean_items)
-                                    .handler(window.handler_for(&pane, move |pane, window, cx| {
-                                        pane.close_clean_items(
-                                            &close_clean_items_action,
-                                            window,
-                                            cx,
-                                        )
-                                        .detach_and_log_err(cx)
-                                    })),
-                            ))
-                            .entry(
-                                "Close All",
-                                Some(Box::new(close_all_items_action.clone())),
-                                window.handler_for(&pane, move |pane, window, cx| {
-                                    pane.close_all_items(&close_all_items_action, window, cx)
-                                        .detach_and_log_err(cx)
-                                }),
-                            );
+                                ))
+                                // We make this optional, instead of using disabled as to not overwhelm the context menu unnecessarily
+                                .extend(has_multibuffer_items.then(|| {
+                                    ContextMenuItem::Entry(
+                                        ContextMenuEntry::new("Close Multibuffers")
+                                            .action(Box::new(close_multibuffers_action.clone()))
+                                            .handler(window.handler_for(
+                                                &pane,
+                                                move |pane, window, cx| {
+                                                    pane.close_multibuffer_items(
+                                                        &close_multibuffers_action,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                    .detach_and_log_err(cx);
+                                                },
+                                            )),
+                                    )
+                                }))
+                                .separator()
+                                .item(ContextMenuItem::Entry(
+                                    ContextMenuEntry::new("Close Left")
+                                        .action(Box::new(close_items_to_the_left_action.clone()))
+                                        .disabled(!has_items_to_left)
+                                        .handler(window.handler_for(
+                                            &pane,
+                                            move |pane, window, cx| {
+                                                pane.close_items_to_the_left_by_id(
+                                                    Some(item_id),
+                                                    &close_items_to_the_left_action,
+                                                    window,
+                                                    cx,
+                                                )
+                                                .detach_and_log_err(cx);
+                                            },
+                                        )),
+                                ))
+                                .item(ContextMenuItem::Entry(
+                                    ContextMenuEntry::new("Close Right")
+                                        .action(Box::new(close_items_to_the_right_action.clone()))
+                                        .disabled(!has_items_to_right)
+                                        .handler(window.handler_for(
+                                            &pane,
+                                            move |pane, window, cx| {
+                                                pane.close_items_to_the_right_by_id(
+                                                    Some(item_id),
+                                                    &close_items_to_the_right_action,
+                                                    window,
+                                                    cx,
+                                                )
+                                                .detach_and_log_err(cx);
+                                            },
+                                        )),
+                                ))
+                                .separator()
+                                .item(ContextMenuItem::Entry(
+                                    ContextMenuEntry::new("Close Clean")
+                                        .action(Box::new(close_clean_items_action.clone()))
+                                        .disabled(!has_clean_items)
+                                        .handler(window.handler_for(
+                                            &pane,
+                                            move |pane, window, cx| {
+                                                pane.close_clean_items(
+                                                    &close_clean_items_action,
+                                                    window,
+                                                    cx,
+                                                )
+                                                .detach_and_log_err(cx)
+                                            },
+                                        )),
+                                ))
+                                .entry(
+                                    "Close All",
+                                    Some(Box::new(close_all_items_action.clone())),
+                                    window.handler_for(&pane, move |pane, window, cx| {
+                                        pane.close_all_items(&close_all_items_action, window, cx)
+                                            .detach_and_log_err(cx)
+                                    }),
+                                );
+                        }
 
                         let pin_tab_entries = |menu: ContextMenu| {
-                            menu.separator().map(|this| {
+                            menu.map(|this| {
                                 if is_pinned {
                                     this.entry(
                                         "Unpin Tab",
@@ -3251,7 +3274,7 @@ impl Pane {
                             })
                         };
 
-                        if capability != Capability::ReadOnly {
+                        if single_entry_to_resolve.is_none() && capability != Capability::ReadOnly {
                             let read_only_label = if capability.editable() {
                                 "Make Tab Read-Only"
                             } else {
@@ -3292,6 +3315,18 @@ impl Pane {
                             let parent_abs_path = entry_abs_path
                                 .as_deref()
                                 .and_then(|abs_path| Some(abs_path.parent()?.to_path_buf()));
+                            let history_project_path = project_path.clone();
+                            let has_file_history =
+                                project_path.as_ref().is_some_and(|project_path| {
+                                    pane.read(cx).project.upgrade().is_some_and(|project| {
+                                        project
+                                            .read(cx)
+                                            .git_store()
+                                            .read(cx)
+                                            .repository_and_path_for_project_path(project_path, cx)
+                                            .is_some()
+                                    })
+                                });
                             let relative_path = project_path
                                 .map(|project_path| project_path.path)
                                 .filter(|_| has_relative_path);
@@ -3310,8 +3345,13 @@ impl Pane {
 
                             let entry_id = entry.to_proto();
 
+                            let has_copy_entries =
+                                entry_abs_path.is_some() || relative_path.is_some();
+                            let has_location_entries = visible_in_project_panel
+                                || (is_local && reveal_path.is_some())
+                                || parent_abs_path.is_some();
+
                             menu = menu
-                                .separator()
                                 .when_some(entry_abs_path, |menu, abs_path| {
                                     menu.entry(
                                         "Copy Path",
@@ -3339,9 +3379,27 @@ impl Pane {
                                         }),
                                     )
                                 })
+                                .when(has_copy_entries && has_location_entries, |menu| {
+                                    menu.separator()
+                                })
+                                .when(visible_in_project_panel, |menu| {
+                                    menu.entry(
+                                        "Reveal In Project Panel",
+                                        Some(Box::new(RevealInProjectPanel::default())),
+                                        window.handler_for(&pane, move |pane, _, cx| {
+                                            pane.project
+                                                .update(cx, |_, cx| {
+                                                    cx.emit(project::Event::RevealInProjectPanel(
+                                                        ProjectEntryId::from_proto(entry_id),
+                                                    ))
+                                                })
+                                                .ok();
+                                        }),
+                                    )
+                                })
                                 .when(is_local, |menu| {
                                     menu.when_some(reveal_path, |menu, reveal_path| {
-                                        menu.separator().entry(
+                                        menu.entry(
                                             ui::utils::reveal_in_file_manager_label(is_remote),
                                             Some(Box::new(
                                                 zed_actions::editor::RevealInFileManager,
@@ -3358,22 +3416,6 @@ impl Pane {
                                         )
                                     })
                                 })
-                                .map(pin_tab_entries)
-                                .when(visible_in_project_panel, |menu| {
-                                    menu.entry(
-                                        "Reveal In Project Panel",
-                                        Some(Box::new(RevealInProjectPanel::default())),
-                                        window.handler_for(&pane, move |pane, _, cx| {
-                                            pane.project
-                                                .update(cx, |_, cx| {
-                                                    cx.emit(project::Event::RevealInProjectPanel(
-                                                        ProjectEntryId::from_proto(entry_id),
-                                                    ))
-                                                })
-                                                .ok();
-                                        }),
-                                    )
-                                })
                                 .when_some(parent_abs_path, |menu, parent_abs_path| {
                                     menu.entry(
                                         "Open in Terminal",
@@ -3389,9 +3431,44 @@ impl Pane {
                                             );
                                         }),
                                     )
+                                })
+                                .when(has_copy_entries || has_location_entries, |menu| {
+                                    menu.separator()
+                                })
+                                .map(pin_tab_entries)
+                                .when(capability != Capability::ReadOnly, |menu| {
+                                    let read_only_label = if capability.editable() {
+                                        "Make Tab Read-Only"
+                                    } else {
+                                        "Make Tab Editable"
+                                    };
+                                    menu.entry(
+                                        read_only_label,
+                                        None,
+                                        window.handler_for(&pane, move |pane, window, cx| {
+                                            if let Some(item) = pane.item_for_index(ix) {
+                                                item.toggle_read_only(window, cx);
+                                            }
+                                        }),
+                                    )
+                                })
+                                .when_some(history_project_path, |menu, project_path| {
+                                    let action = OpenFileHistoryForPath(project_path);
+                                    let handler_action = action.clone();
+                                    menu.separator().item(ContextMenuItem::Entry(
+                                        ContextMenuEntry::new("View File History")
+                                            .action(Box::new(action))
+                                            .disabled(!has_file_history)
+                                            .handler(move |window, cx| {
+                                                window.dispatch_action(
+                                                    Box::new(handler_action.clone()),
+                                                    cx,
+                                                );
+                                            }),
+                                    ))
                                 });
                         } else {
-                            menu = menu.map(pin_tab_entries);
+                            menu = menu.separator().map(pin_tab_entries);
                         }
                     };
 
