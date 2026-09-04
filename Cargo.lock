@@ -14003,6 +14003,7 @@ dependencies = [
  "notifications",
  "pretty_assertions",
  "project",
+ "proto",
  "rayon",
  "schemars 1.0.4",
  "serde",

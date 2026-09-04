@@ -575,6 +575,15 @@ impl LanguageRegistry {
             .and_then(|state| state.available_languages.find_name_by_extension(extension))
     }
 
+    pub fn language_name_for_file_path(self: &Arc<Self>, path: &Path) -> Option<LanguageName> {
+        let state = self.state.read();
+        let language_id = state.available_languages.find_for_file(path, None, None)?;
+        state
+            .available_languages
+            .get_language(language_id)
+            .map(AvailableLanguage::name)
+    }
+
     pub fn language_for_name_or_extension(
         self: &Arc<Self>,
         string: &str,

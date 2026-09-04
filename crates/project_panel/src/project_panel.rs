@@ -70,6 +70,7 @@ use util::{
     maybe,
     paths::{PathStyle, compare_paths},
     rel_path::{RelPath, RelPathBuf},
+    size::format_file_size,
 };
 use workspace::{
     DraggedSelection, OpenInTerminal, OpenMode, OpenOptions, OpenVisible, PreviewTabsSettings,
@@ -291,6 +292,126 @@ struct EntryDetails {
     is_private: bool,
     worktree_id: WorktreeId,
     canonical_path: Option<Arc<Path>>,
+    file_tooltip: Option<FileTooltipDetails>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct FileTooltipDetails {
+    name: SharedString,
+    file_type: SharedString,
+    size: Option<SharedString>,
+    path: SharedString,
+    canonical_path: Option<SharedString>,
+}
+
+impl FileTooltipDetails {
+    fn new(
+        path: &RelPath,
+        root_name: &RelPath,
+        size: u64,
+        is_fifo: bool,
+        canonical_path: Option<&Path>,
+        path_style: PathStyle,
+        languages: &Arc<language::LanguageRegistry>,
+    ) -> Self {
+        let path_for_type = if path.is_empty() {
+            root_name.as_std_path()
+        } else {
+            path.as_std_path()
+        };
+        let extension = path_for_type
+            .extension()
+            .and_then(|extension| extension.to_str());
+        let file_type = if is_fifo {
+            SharedString::from("Named Pipe")
+        } else if let Some(language_name) = languages.language_name_for_file_path(path_for_type) {
+            match extension {
+                Some(extension) => format!("{language_name} (.{extension})").into(),
+                None => language_name.into(),
+            }
+        } else {
+            match extension {
+                Some(extension) => format!("{} File", extension.to_uppercase()).into(),
+                None => SharedString::from("File"),
+            }
+        };
+        let name = path
+            .file_name()
+            .unwrap_or_else(|| root_name.as_unix_str())
+            .to_string()
+            .into();
+        let path = if path.is_empty() {
+            root_name.display(path_style).to_string()
+        } else if root_name.is_empty() {
+            path.display(path_style).to_string()
+        } else {
+            format!(
+                "{}{}{}",
+                root_name.display(path_style),
+                path_style.primary_separator(),
+                path.display(path_style)
+            )
+        }
+        .into();
+
+        Self {
+            name,
+            file_type,
+            size: (!is_fifo).then(|| format_file_size(size, false).into()),
+            path,
+            canonical_path: canonical_path.map(|path| path.to_string_lossy().into_owned().into()),
+        }
+    }
+}
+
+fn render_file_tooltip(details: &FileTooltipDetails, cx: &mut App) -> AnyElement {
+    let detail_row = |label, value: SharedString| {
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .items_start()
+            .gap_2()
+            .child(
+                div()
+                    .w(rems(3.5))
+                    .flex_none()
+                    .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .whitespace_normal()
+                    .child(Label::new(value).size(LabelSize::Small)),
+            )
+    };
+
+    v_flex()
+        .max_w_72()
+        .min_w_0()
+        .gap_1()
+        .child(
+            div()
+                .min_w_0()
+                .whitespace_normal()
+                .child(Label::new(details.name.clone())),
+        )
+        .child(
+            v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_0p5()
+                .child(detail_row("Type", details.file_type.clone()))
+                .when_some(details.size.clone(), |this, size| {
+                    this.child(detail_row("Size", size))
+                })
+                .child(detail_row("Path", details.path.clone()))
+                .when_some(details.canonical_path.clone(), |this, canonical_path| {
+                    this.child(detail_row("Target", canonical_path))
+                }),
+        )
+        .text_color(cx.theme().colors().text)
+        .into_any_element()
 }
 
 /// The glyph a row's diagnostic mark decorates, and the shape of that mark.
@@ -5754,6 +5875,7 @@ impl ProjectPanel {
         let sticky_index = details.sticky.as_ref().map(|this| this.sticky_index);
         let settings = ProjectPanelSettings::get_global(cx);
         let show_editor = details.is_editing && !details.is_processing;
+        let show_file_tooltip = !details.is_editing && !details.is_processing;
 
         let selection = SelectedEntry {
             worktree_id: details.worktree_id,
@@ -5784,6 +5906,11 @@ impl ProjectPanel {
         let item_colors = get_item_color(is_sticky, cx);
 
         let canonical_path = details.canonical_path.clone();
+        let file_tooltip = if show_file_tooltip {
+            details.file_tooltip.clone()
+        } else {
+            None
+        };
         let path_style = self.project.read(cx).path_style(cx);
         let path = details.path.clone();
 
@@ -5886,6 +6013,11 @@ impl ProjectPanel {
             .border_r_2()
             .border_color(border_color)
             .hover(|style| style.bg(bg_hover_color).border_color(border_hover_color))
+            .when_some(file_tooltip, |this, tooltip| {
+                this.tooltip(Tooltip::element(move |_window, cx| {
+                    render_file_tooltip(&tooltip, cx)
+                }))
+            })
             .when(is_sticky, |this| this.block_mouse_except_scroll())
             .when(!is_sticky, |this| {
                 this.when(
@@ -6240,16 +6372,18 @@ impl ProjectPanel {
                             || diagnostic_count.is_some()
                             || git_indicator.is_some(),
                         |this| {
-                            let symlink_element = canonical_path.map(|path| {
+                            let symlink_element = canonical_path.map(|tooltip_path| {
                                 div()
                                     .id("symlink_icon")
-                                    .tooltip(move |_window, cx| {
-                                        Tooltip::with_meta(
-                                            path.to_string_lossy().into_owned(),
-                                            None,
-                                            "Symbolic Link",
-                                            cx,
-                                        )
+                                    .when(kind.is_dir(), |this| {
+                                        this.tooltip(move |_window, cx| {
+                                            Tooltip::with_meta(
+                                                tooltip_path.to_string_lossy().into_owned(),
+                                                None,
+                                                "Symbolic Link",
+                                                cx,
+                                            )
+                                        })
                                     })
                                     .child(
                                         Icon::new(IconName::ArrowUpRight)
@@ -6779,6 +6913,18 @@ impl ProjectPanel {
             .as_ref()
             .is_some_and(|e| e.is_cut() && e.items().contains(&selection));
 
+        let file_tooltip = entry.kind.is_file().then(|| {
+            FileTooltipDetails::new(
+                &entry.path,
+                root_name,
+                entry.size,
+                entry.is_fifo,
+                entry.canonical_path.as_deref(),
+                path_style,
+                self.project.read(cx).languages(),
+            )
+        });
+
         EntryDetails {
             filename,
             chevron,
@@ -6803,6 +6949,7 @@ impl ProjectPanel {
             is_private: entry.is_private,
             worktree_id,
             canonical_path: entry.canonical_path.clone(),
+            file_tooltip,
         }
     }
 
