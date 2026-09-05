@@ -229,6 +229,7 @@ fn decode_git_text(bytes: Vec<u8>) -> Result<String> {
 pub struct CommitDiff {
     pub files: Vec<CommitFile>,
     pub is_shallow_boundary: bool,
+    pub history_path: Option<RepoPath>,
 }
 
 #[derive(Debug)]
@@ -301,6 +302,7 @@ fn decode_commit_diff(diff: git::repository::CommitDiff) -> CommitDiff {
     CommitDiff {
         files,
         is_shallow_boundary: diff.is_shallow_boundary,
+        history_path: None,
     }
 }
 
@@ -4586,11 +4588,20 @@ impl GitStore {
         let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
         let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
 
+        let history_path = envelope
+            .payload
+            .history_path
+            .as_deref()
+            .map(RepoPath::from_proto)
+            .transpose()?;
+        let base_commit = envelope.payload.base_commit;
         let commit_diff = repository_handle
             .update(&mut cx, |repository_handle, cx| {
-                repository_handle.load_commit_diff(
+                repository_handle.load_commit_diff_with_base(
                     envelope.payload.commit,
+                    base_commit.clone(),
                     envelope.payload.ignore_shallow_boundary,
+                    history_path,
                     cx,
                 )
             })
@@ -4607,6 +4618,10 @@ impl GitStore {
                 })
                 .collect(),
             is_shallow_boundary: commit_diff.is_shallow_boundary,
+            base_commit,
+            history_path: commit_diff
+                .history_path
+                .map(|path| path.as_unix_str().to_owned()),
         })
     }
 
@@ -7288,16 +7303,53 @@ impl Repository {
         ignore_shallow_boundary: bool,
         cx: &App,
     ) -> Task<Result<CommitDiff>> {
+        self.load_commit_diff_with_history_path(commit, ignore_shallow_boundary, None, cx)
+    }
+
+    pub fn load_commit_diff_with_history_path(
+        &self,
+        commit: String,
+        ignore_shallow_boundary: bool,
+        history_path: Option<RepoPath>,
+        cx: &App,
+    ) -> Task<Result<CommitDiff>> {
+        self.load_commit_diff_with_base(commit, None, ignore_shallow_boundary, history_path, cx)
+    }
+
+    pub fn load_commit_diff_with_base(
+        &self,
+        commit: String,
+        base_commit: Option<String>,
+        ignore_shallow_boundary: bool,
+        history_path: Option<RepoPath>,
+        cx: &App,
+    ) -> Task<Result<CommitDiff>> {
         let id = self.id;
         let repository_state = self.repository_state.clone();
         let object_read_limiter = self.object_read_limiter.clone();
         cx.spawn(async move |cx| {
             let _permit = object_read_limiter.acquire_arc().await;
             match repository_state.await.map_err(|err| anyhow::anyhow!(err))? {
-                RepositoryState::Local(LocalRepositoryState { backend, .. }) => backend
-                    .load_commit(commit, ignore_shallow_boundary, cx.clone())
-                    .await
-                    .map(decode_commit_diff),
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    let mut diff = decode_commit_diff(
+                        backend
+                            .load_commit_with_base(
+                                commit.clone(),
+                                base_commit.clone(),
+                                ignore_shallow_boundary,
+                                cx.clone(),
+                            )
+                            .await?,
+                    );
+                    if let Some(path) = history_path.filter(|_| base_commit.is_none()) {
+                        diff.history_path = if diff.files.iter().any(|file| file.path == path) {
+                            Some(path)
+                        } else {
+                            backend.file_history_path(commit, path).await?
+                        };
+                    }
+                    Ok(diff)
+                }
                 RepositoryState::Remote(RemoteRepositoryState {
                     client, project_id, ..
                 }) => {
@@ -7307,8 +7359,14 @@ impl Repository {
                             repository_id: id.to_proto(),
                             commit,
                             ignore_shallow_boundary,
+                            history_path: history_path.map(|path| path.as_unix_str().to_owned()),
+                            base_commit: base_commit.clone(),
                         })
                         .await?;
+                    anyhow::ensure!(
+                        response.base_commit == base_commit,
+                        "remote host does not support commit comparison; update the host Zed version"
+                    );
                     Ok(CommitDiff {
                         files: response
                             .files
@@ -7323,6 +7381,11 @@ impl Repository {
                             })
                             .collect::<Result<Vec<_>>>()?,
                         is_shallow_boundary: response.is_shallow_boundary,
+                        history_path: response
+                            .history_path
+                            .as_deref()
+                            .map(RepoPath::from_proto)
+                            .transpose()?,
                     })
                 }
             }

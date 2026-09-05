@@ -1086,7 +1086,7 @@ pub fn init(cx: &mut App) {
                         let git_store = git_store.clone();
                         workspace
                             .update(cx, |workspace, cx| {
-                                open_or_reuse_graph(
+                                crate::git_graph_next::open_or_reuse_graph_next(
                                     workspace,
                                     repo_id,
                                     git_store,
@@ -6370,11 +6370,13 @@ mod tests {
         cx.run_until_parked();
 
         workspace.read_with(cx, |workspace, cx| {
-            let graphs = workspace.items_of_type::<GitGraph>(cx).collect::<Vec<_>>();
+            let graphs = workspace
+                .items_of_type::<crate::git_graph_next::GitGraphNext>(cx)
+                .collect::<Vec<_>>();
             assert_eq!(graphs.len(), 1);
             assert_eq!(
-                graphs[0].read(cx).log_source,
-                LogSource::Path(tracked1_repo_path.clone())
+                graphs[0].read(cx).log_source_for_test(),
+                &LogSource::Path(tracked1_repo_path.clone())
             );
         });
 
@@ -6397,11 +6399,13 @@ mod tests {
         cx.run_until_parked();
 
         workspace.read_with(cx, |workspace, cx| {
-            let graphs = workspace.items_of_type::<GitGraph>(cx).collect::<Vec<_>>();
+            let graphs = workspace
+                .items_of_type::<crate::git_graph_next::GitGraphNext>(cx)
+                .collect::<Vec<_>>();
             assert_eq!(graphs.len(), 1);
             assert_eq!(
-                graphs[0].read(cx).log_source,
-                LogSource::Path(tracked1_repo_path.clone())
+                graphs[0].read(cx).log_source_for_test(),
+                &LogSource::Path(tracked1_repo_path.clone())
             );
         });
 
@@ -6473,15 +6477,17 @@ mod tests {
         cx.run_until_parked();
 
         workspace.read_with(cx, |workspace, cx| {
-            let graphs = workspace.items_of_type::<GitGraph>(cx).collect::<Vec<_>>();
+            let graphs = workspace
+                .items_of_type::<crate::git_graph_next::GitGraphNext>(cx)
+                .collect::<Vec<_>>();
             assert_eq!(graphs.len(), 2);
             let latest = graphs
                 .into_iter()
                 .max_by_key(|graph| graph.entity_id())
                 .expect("expected a git graph");
             assert_eq!(
-                latest.read(cx).log_source,
-                LogSource::Path(tracked2_repo_path)
+                latest.read(cx).log_source_for_test(),
+                &LogSource::Path(tracked2_repo_path)
             );
         });
     }
@@ -8413,6 +8419,7 @@ mod tests {
                     is_binary: false,
                 }],
                 is_shallow_boundary: false,
+                history_path: None,
             });
             graph.selected_commit_diff_stats = Some((1, 1));
             cx.notify();

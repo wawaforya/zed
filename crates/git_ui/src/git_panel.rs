@@ -2729,7 +2729,7 @@ impl GitPanel {
             .update(cx, |workspace, cx| {
                 for entry in entries {
                     if !entry.status.is_created() {
-                        crate::git_graph::open_or_reuse_graph(
+                        crate::git_graph_next::open_or_reuse_graph_next(
                             workspace,
                             repository_id,
                             git_store.clone(),
@@ -10656,7 +10656,7 @@ mod tests {
             assert_eq!(workspace.items_of_type::<SoloDiffView>(cx).count(), 2);
             assert_eq!(
                 workspace
-                    .items_of_type::<crate::git_graph::GitGraph>(cx)
+                    .items_of_type::<crate::git_graph_next::GitGraphNext>(cx)
                     .count(),
                 2
             );

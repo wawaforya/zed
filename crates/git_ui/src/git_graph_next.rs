@@ -1,0 +1,6718 @@
+pub use crate::commit_context_menu::{CopyCommitSha, CopyCommitTag, OpenCommitView};
+use crate::{
+    commit_context_menu::{CommitContextMenuData, CommitContextMenuSource, commit_context_menu},
+    commit_tooltip::CommitAvatar,
+    commit_view::CommitView,
+    git_status_icon,
+};
+use collections::{BTreeMap, HashMap, IndexSet};
+use editor::Editor;
+use file_icons::FileIcons;
+use git::{
+    BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
+    parse_git_remote_url,
+    repository::{InitialGraphCommitData, LogOrder, LogSource, RepoPath, SearchCommitArgs},
+    status::{FileStatus, StatusCode, TrackedStatus},
+};
+use gpui::{
+    Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, DefiniteLength,
+    DismissEvent, DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable,
+    Hsla, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, ScrollHandle, ScrollStrategy,
+    ScrollWheelEvent, SharedString, Subscription, Task, TextStyleRefinement,
+    UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, point, prelude::*,
+    px, uniform_list,
+};
+use language::line_diff;
+use markdown::{Markdown, MarkdownElement};
+use menu::{Cancel, SelectFirst, SelectLast, SelectNext, SelectPrevious};
+use picker::{Picker, PickerDelegate};
+use project::{
+    ProjectPath,
+    git_store::{
+        CommitDataState, CommitDiff, CommitFile, GitGraphEvent, GitStore, GitStoreEvent,
+        GraphDataResponse, Repository, RepositoryEvent, RepositoryId,
+    },
+};
+use smallvec::{SmallVec, smallvec};
+use std::{
+    cell::Cell,
+    ops::Range,
+    rc::Rc,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
+use zed_actions::{
+    buffer_search,
+    search::{SelectNextMatch, SelectPreviousMatch, ToggleCaseSensitive},
+};
+
+use theme::AccentColors;
+use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
+use ui::{
+    Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, DiffStat, Divider,
+    HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem, ListItemSpacing,
+    RedistributableColumnsState, ScrollableHandle, Table, TableInteractionState,
+    TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar, bind_redistributable_columns,
+    prelude::*, redistribute_hidden_fractions, redistribute_hidden_widths,
+    render_redistributable_columns_resize_handles, render_table_header, table_row::TableRow,
+};
+use util::{ResultExt, debug_panic};
+use workspace::{
+    ModalView, Workspace,
+    item::{Item, ItemEvent, TabTooltipContent},
+};
+
+const COMMIT_CIRCLE_RADIUS: Pixels = px(3.5);
+const COMMIT_CIRCLE_STROKE_WIDTH: Pixels = px(1.5);
+const LANE_WIDTH: Pixels = px(16.0);
+const LEFT_PADDING: Pixels = px(12.0);
+const LINE_WIDTH: Pixels = px(1.5);
+const RESIZE_HANDLE_WIDTH: f32 = 8.0;
+const COPIED_STATE_DURATION: Duration = Duration::from_secs(2);
+const COMMIT_TAG_LIST_WIDTH_IN_REMS: Rems = rems(10.);
+const TREE_INDENT: f32 = 20.0;
+const TABLE_COLUMN_COUNT: usize = 4;
+const ROW_VERTICAL_PADDING: Pixels = px(4.0);
+
+struct CopiedState {
+    copied_at: Option<Instant>,
+}
+
+impl CopiedState {
+    fn new(_window: &mut Window, _cx: &mut Context<Self>) -> Self {
+        Self { copied_at: None }
+    }
+
+    fn is_copied(&self) -> bool {
+        self.copied_at
+            .map(|t| t.elapsed() < COPIED_STATE_DURATION)
+            .unwrap_or(false)
+    }
+
+    fn mark_copied(&mut self) {
+        self.copied_at = Some(Instant::now());
+    }
+}
+
+struct DraggedGraphDetailSplitHandle;
+struct DraggedDetailContentSplitHandle;
+
+struct CommitTagPicker {
+    picker: Entity<Picker<CommitTagPickerDelegate>>,
+}
+
+impl CommitTagPicker {
+    fn new(tag_names: Vec<SharedString>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let delegate = CommitTagPickerDelegate {
+            picker: cx.entity().downgrade(),
+            tag_names,
+            selected_index: 0,
+        };
+        let picker = cx.new(|cx| {
+            Picker::nonsearchable_uniform_list(delegate, window, cx)
+                .initial_width(COMMIT_TAG_LIST_WIDTH_IN_REMS)
+        });
+        Self { picker }
+    }
+}
+
+impl EventEmitter<DismissEvent> for CommitTagPicker {}
+impl ModalView for CommitTagPicker {}
+
+impl Focusable for CommitTagPicker {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.picker.focus_handle(cx)
+    }
+}
+
+impl Render for CommitTagPicker {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex().child(self.picker.clone())
+    }
+}
+
+struct CommitTagPickerDelegate {
+    picker: WeakEntity<CommitTagPicker>,
+    tag_names: Vec<SharedString>,
+    selected_index: usize,
+}
+
+impl PickerDelegate for CommitTagPickerDelegate {
+    type ListItem = ListItem;
+
+    fn name() -> &'static str {
+        "commit-tag"
+    }
+
+    fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
+        "Copy Tag".into()
+    }
+
+    fn match_count(&self) -> usize {
+        self.tag_names.len()
+    }
+
+    fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    fn set_selected_index(
+        &mut self,
+        ix: usize,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) {
+        self.selected_index = ix;
+    }
+
+    fn update_matches(
+        &mut self,
+        _query: String,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Task<()> {
+        Task::ready(())
+    }
+
+    fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        if let Some(tag_name) = self.tag_names.get(self.selected_index) {
+            cx.write_to_clipboard(ClipboardItem::new_string(tag_name.to_string()));
+        }
+        self.dismissed(window, cx);
+    }
+
+    fn dismissed(&mut self, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        self.picker
+            .update(cx, |_this, cx| cx.emit(DismissEvent))
+            .ok();
+    }
+
+    fn render_match(
+        &self,
+        ix: usize,
+        selected: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Option<Self::ListItem> {
+        Some(
+            ListItem::new(ix)
+                .inset(true)
+                .spacing(ListItemSpacing::Sparse)
+                .toggle_state(selected)
+                .child(Label::new(self.tag_names.get(ix)?.clone())),
+        )
+    }
+}
+
+#[derive(Clone)]
+struct ChangedFileEntry {
+    status: FileStatus,
+    file_name: SharedString,
+    dir_path: SharedString,
+    repo_path: RepoPath,
+    diff_stats: Option<(usize, usize)>,
+}
+
+impl ChangedFileEntry {
+    fn from_commit_file(file: &CommitFile, _cx: &App) -> Self {
+        let file_name: SharedString = file
+            .path
+            .file_name()
+            .map(|n| n.to_string())
+            .unwrap_or_default()
+            .into();
+        let dir_path: SharedString = file
+            .path
+            .parent()
+            .map(|p| p.as_unix_str().to_string())
+            .unwrap_or_default()
+            .into();
+
+        let status_code = match (&file.old_text, &file.new_text) {
+            (None, Some(_)) => StatusCode::Added,
+            (Some(_), None) => StatusCode::Deleted,
+            _ => StatusCode::Modified,
+        };
+
+        let status = FileStatus::Tracked(TrackedStatus {
+            index_status: status_code,
+            worktree_status: StatusCode::Unmodified,
+        });
+
+        Self {
+            status,
+            file_name,
+            dir_path,
+            repo_path: file.path.clone(),
+            diff_stats: (!file.is_binary).then(|| compute_file_diff_stats(file)),
+        }
+    }
+
+    fn open_in_commit_view(
+        &self,
+        commit_sha: &SharedString,
+        repository: &WeakEntity<Repository>,
+        workspace: &WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        CommitView::open(
+            commit_sha.to_string(),
+            repository.clone(),
+            workspace.clone(),
+            None,
+            Some(self.repo_path.clone()),
+            window,
+            cx,
+        );
+    }
+
+    fn render(
+        &self,
+        ix: usize,
+        depth: usize,
+        directory_label: Option<SharedString>,
+        commit_sha: SharedString,
+        repository: WeakEntity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        git_graph: WeakEntity<GitGraphNext>,
+        selected: bool,
+        _cx: &App,
+    ) -> AnyElement {
+        let file_name = self.file_name.clone();
+        let _dir_path = self.dir_path.clone();
+
+        ListItem::new(("changed-file", ix))
+            .spacing(ListItemSpacing::Sparse)
+            .toggle_state(selected)
+            .indent_level(depth)
+            .indent_step_size(px(TREE_INDENT))
+            .start_slot(git_status_icon(self.status))
+            .end_slot(match self.diff_stats {
+                Some((added, removed)) => {
+                    DiffStat::new(("changed-file-diff-stat", ix), added, removed)
+                        .label_size(LabelSize::Small)
+                        .into_any_element()
+                }
+                None => Label::new("Binary")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .into_any_element(),
+            })
+            .child(
+                Label::new(file_name.clone())
+                    .size(LabelSize::Small)
+                    .truncate(),
+            )
+            .when_some(directory_label, |this, directory_label| {
+                this.child(
+                    Label::new(directory_label)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate_start(),
+                )
+            })
+            .on_secondary_mouse_down({
+                let git_graph = git_graph.clone();
+                let path = self.repo_path.clone();
+                move |event, window, cx| {
+                    cx.stop_propagation();
+                    git_graph
+                        .update(cx, |graph, cx| {
+                            graph.deploy_changed_path_context_menu(
+                                path.clone(),
+                                false,
+                                event.position,
+                                window,
+                                cx,
+                            );
+                        })
+                        .log_err();
+                }
+            })
+            .on_click({
+                let entry = self.clone();
+                move |event: &ClickEvent, window, cx| {
+                    if event.click_count() >= 2
+                        && git_graph
+                            .read_with(cx, |graph, _| graph.active_comparison.is_none())
+                            .log_err()
+                            .unwrap_or(false)
+                    {
+                        entry.open_in_commit_view(&commit_sha, &repository, &workspace, window, cx);
+                    } else {
+                        git_graph
+                            .update(cx, |git_graph, cx| {
+                                git_graph.select_changed_file(entry.repo_path.clone(), window, cx);
+                            })
+                            .ok();
+                    }
+                }
+            })
+            .into_any_element()
+    }
+}
+
+enum ChangedFileTreeEntry {
+    Directory(ChangedFileDirectoryEntry),
+    File(ChangedFileTreeStatusEntry),
+}
+
+struct ChangedFileTreeStatusEntry {
+    entry: ChangedFileEntry,
+    depth: usize,
+}
+
+impl ChangedFileTreeEntry {
+    fn depth(&self) -> usize {
+        match self {
+            Self::Directory(entry) => entry.depth,
+            Self::File(entry) => entry.depth,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ChangedFileStickyCandidate {
+    index: usize,
+    depth: usize,
+}
+
+impl ui::StickyCandidate for ChangedFileStickyCandidate {
+    fn depth(&self) -> usize {
+        self.depth
+    }
+}
+
+fn changed_file_parent_indices(entries: &[ChangedFileTreeEntry]) -> Vec<Option<usize>> {
+    let mut ancestors = Vec::new();
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            ancestors.truncate(entry.depth());
+            let parent = ancestors.last().copied();
+            if matches!(entry, ChangedFileTreeEntry::Directory(_)) {
+                ancestors.push(index);
+            }
+            parent
+        })
+        .collect()
+}
+
+fn changed_file_ancestor_indices(parents: &[Option<usize>], index: usize) -> Vec<usize> {
+    let mut ancestors = Vec::new();
+    let mut parent = parents.get(index).copied().flatten();
+    while let Some(index) = parent {
+        ancestors.push(index);
+        parent = parents.get(index).copied().flatten();
+    }
+    ancestors.reverse();
+    ancestors
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ChangedFilesViewMode {
+    Flat,
+    #[default]
+    Tree,
+}
+
+impl ChangedFilesViewMode {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Flat => Self::Tree,
+            Self::Tree => Self::Flat,
+        }
+    }
+
+    fn is_tree(self) -> bool {
+        matches!(self, Self::Tree)
+    }
+}
+
+struct ChangedFileDirectoryEntry {
+    path: RepoPath,
+    name: SharedString,
+    depth: usize,
+    expanded: bool,
+}
+
+impl ChangedFileDirectoryEntry {
+    fn render(&self, ix: usize, git_graph: WeakEntity<GitGraphNext>, cx: &App) -> AnyElement {
+        self.render_with_sticky_index(ix, None, git_graph, cx)
+    }
+
+    fn render_with_sticky_index(
+        &self,
+        ix: usize,
+        sticky_index: Option<usize>,
+        git_graph: WeakEntity<GitGraphNext>,
+        cx: &App,
+    ) -> AnyElement {
+        let path = self.path.clone();
+        let expanded = self.expanded;
+        let folder_icon = FileIcons::get_folder_icon(expanded, path.as_std_path(), cx)
+            .map(|icon| {
+                Icon::from_path(icon)
+                    .size(IconSize::Small)
+                    .color(Color::Muted)
+            })
+            .unwrap_or_else(|| {
+                let icon = if expanded {
+                    IconName::FolderOpen
+                } else {
+                    IconName::Folder
+                };
+                Icon::new(icon).size(IconSize::Small).color(Color::Muted)
+            });
+
+        let row = ListItem::new((
+            if sticky_index.is_some() {
+                "changed-file-sticky-dir"
+            } else {
+                "changed-file-dir"
+            },
+            ix,
+        ))
+        .spacing(ListItemSpacing::Sparse)
+        .indent_level(self.depth)
+        .indent_step_size(px(TREE_INDENT))
+        .start_slot(folder_icon)
+        .child(
+            Label::new(self.name.clone())
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .truncate(),
+        )
+        .on_click(move |_, window, cx| {
+            git_graph
+                .update(cx, |git_graph, cx| {
+                    if let Some(sticky_index) = sticky_index {
+                        git_graph
+                            .changed_files_scroll_handle
+                            .scroll_to_item_strict_with_offset(
+                                ix,
+                                ScrollStrategy::Top,
+                                sticky_index,
+                            );
+                        let repository_id = git_graph.repo_id;
+                        let selected_commit = git_graph
+                            .selected_entry_idx
+                            .and_then(|index| git_graph.graph_data.commits.get(index))
+                            .map(|commit| commit.data.sha);
+                        // Move the original row below the sticky boundary after scrolling.
+                        cx.on_next_frame(window, move |_, window, cx| {
+                            cx.on_next_frame(window, move |this, _, cx| {
+                                if this.repo_id != repository_id
+                                    || !this.changed_files_view_mode.is_tree()
+                                    || this
+                                        .selected_entry_idx
+                                        .and_then(|index| this.graph_data.commits.get(index))
+                                        .map(|commit| commit.data.sha)
+                                        != selected_commit
+                                {
+                                    return;
+                                }
+                                let mut offset = this.changed_files_scroll_handle.offset();
+                                offset.y = (offset.y + px(1.)).min(px(0.));
+                                this.changed_files_scroll_handle.set_offset(offset);
+                                cx.notify();
+                            });
+                        });
+                    } else {
+                        git_graph
+                            .changed_files_expanded_dirs
+                            .insert(path.clone(), !expanded);
+                    }
+                    cx.notify();
+                })
+                .log_err();
+        });
+        if sticky_index.is_some() {
+            div()
+                .size_full()
+                .bg(cx.theme().colors().editor_background)
+                .block_mouse_except_scroll()
+                .child(row)
+                .into_any_element()
+        } else {
+            row.into_any_element()
+        }
+    }
+}
+
+fn changed_paths_in_directory(files: &[ChangedFileEntry], directory: &RepoPath) -> Vec<RepoPath> {
+    let mut paths = files
+        .iter()
+        .filter(|file| file.repo_path.starts_with(directory))
+        .map(|file| file.repo_path.clone())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+fn set_changed_directory_expanded(
+    files: &[ChangedFileEntry],
+    expanded_dirs: &mut HashMap<RepoPath, bool>,
+    directory: &RepoPath,
+    expanded: bool,
+    recursive: bool,
+) {
+    expanded_dirs.insert(directory.clone(), expanded);
+    if recursive {
+        for path in changed_paths_in_directory(files, directory) {
+            let mut parent = path.parent();
+            while let Some(path) = parent {
+                if !path.starts_with(directory) {
+                    break;
+                }
+                expanded_dirs.insert(RepoPath::from_rel_path(path), expanded);
+                parent = path.parent();
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct ChangedFileTreeNode {
+    name: SharedString,
+    path: Option<RepoPath>,
+    children: BTreeMap<SharedString, ChangedFileTreeNode>,
+    files: Vec<ChangedFileEntry>,
+}
+
+fn build_changed_file_tree_entries(
+    mut files: Vec<ChangedFileEntry>,
+    expanded_dirs: &HashMap<RepoPath, bool>,
+) -> Vec<ChangedFileTreeEntry> {
+    files.sort_by(|a, b| a.repo_path.cmp(&b.repo_path));
+
+    let mut root = ChangedFileTreeNode::default();
+    for file in files {
+        let components: Vec<&str> = file.repo_path.components().collect();
+        if components.is_empty() {
+            root.files.push(file);
+            continue;
+        }
+
+        let mut current = &mut root;
+        let mut current_path = String::new();
+
+        for (ix, component) in components.iter().enumerate() {
+            if ix == components.len() - 1 {
+                current.files.push(file.clone());
+            } else {
+                if !current_path.is_empty() {
+                    current_path.push('/');
+                }
+                current_path.push_str(component);
+
+                let Ok(dir_path) = RepoPath::new(&current_path) else {
+                    continue;
+                };
+                let component = SharedString::from(component.to_string());
+
+                current = current
+                    .children
+                    .entry(component.clone())
+                    .or_insert_with(|| ChangedFileTreeNode {
+                        name: component,
+                        path: Some(dir_path),
+                        ..Default::default()
+                    });
+            }
+        }
+    }
+
+    flatten_changed_file_tree(&root, 0, expanded_dirs)
+}
+
+fn flatten_changed_file_tree(
+    node: &ChangedFileTreeNode,
+    depth: usize,
+    expanded_dirs: &HashMap<RepoPath, bool>,
+) -> Vec<ChangedFileTreeEntry> {
+    let mut entries = Vec::new();
+
+    for child in node.children.values() {
+        let (terminal, name) = compact_changed_file_directory_chain(child);
+        let Some(path) = terminal.path.clone().or_else(|| child.path.clone()) else {
+            continue;
+        };
+        let expanded = *expanded_dirs.get(&path).unwrap_or(&true);
+        let child_entries = flatten_changed_file_tree(terminal, depth + 1, expanded_dirs);
+
+        entries.push(ChangedFileTreeEntry::Directory(ChangedFileDirectoryEntry {
+            path,
+            name,
+            depth,
+            expanded,
+        }));
+
+        if expanded {
+            entries.extend(child_entries);
+        }
+    }
+
+    entries.extend(
+        node.files
+            .iter()
+            .cloned()
+            .map(|entry| ChangedFileTreeEntry::File(ChangedFileTreeStatusEntry { entry, depth })),
+    );
+    entries
+}
+
+fn compact_changed_file_directory_chain(
+    mut node: &ChangedFileTreeNode,
+) -> (&ChangedFileTreeNode, SharedString) {
+    let mut parts = vec![node.name.clone()];
+    while node.files.is_empty() && node.children.len() == 1 {
+        let Some(child) = node.children.values().next() else {
+            continue;
+        };
+        if child.path.is_none() {
+            break;
+        }
+        parts.push(child.name.clone());
+        node = child;
+    }
+    (node, SharedString::from(parts.join("/")))
+}
+
+enum QueryState {
+    Pending(SharedString),
+    Confirmed((SharedString, Task<()>)),
+    Empty,
+}
+
+impl QueryState {
+    fn next_state(&mut self) {
+        match self {
+            Self::Confirmed((query, _)) => *self = Self::Pending(std::mem::take(query)),
+            _ => {}
+        };
+    }
+}
+
+struct SearchState {
+    case_sensitive: bool,
+    editor: Entity<Editor>,
+    state: QueryState,
+    matches: IndexSet<Oid>,
+    selected_index: Option<usize>,
+}
+
+struct GraphDetailSplitState {
+    top_ratio: f32,
+    visible_top_ratio: f32,
+}
+
+impl GraphDetailSplitState {
+    fn new() -> Self {
+        Self {
+            top_ratio: 0.25,
+            visible_top_ratio: 0.25,
+        }
+    }
+
+    fn restore_ratio(&mut self, ratio: f64) {
+        let ratio = ratio as f32;
+        if ratio.is_finite() {
+            self.top_ratio = ratio.clamp(0.2, 0.8);
+            self.visible_top_ratio = self.top_ratio;
+        }
+    }
+
+    fn visible_top_ratio(&self) -> f32 {
+        self.visible_top_ratio
+    }
+
+    fn bottom_ratio(&self) -> f32 {
+        1.0 - self.visible_top_ratio
+    }
+
+    fn on_drag_move(
+        &mut self,
+        drag_event: &DragMoveEvent<DraggedGraphDetailSplitHandle>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let bounds = drag_event.bounds;
+        let bounds_height = bounds.bottom() - bounds.top();
+        if bounds_height <= px(0.) {
+            return;
+        }
+
+        let new_ratio = (drag_event.event.position.y - bounds.top()) / bounds_height;
+        self.visible_top_ratio = new_ratio.clamp(0.2, 0.8);
+    }
+
+    fn commit_ratio(&mut self) {
+        self.top_ratio = self.visible_top_ratio;
+    }
+
+    fn on_double_click(&mut self) {
+        self.top_ratio = 0.25;
+        self.visible_top_ratio = 0.25;
+    }
+}
+
+struct DetailContentSplitState {
+    left_ratio: f32,
+    visible_left_ratio: f32,
+}
+
+impl DetailContentSplitState {
+    fn new() -> Self {
+        Self {
+            left_ratio: 0.2,
+            visible_left_ratio: 0.2,
+        }
+    }
+
+    fn restore_ratio(&mut self, ratio: f64) {
+        let ratio = ratio as f32;
+        if ratio.is_finite() {
+            self.left_ratio = ratio.clamp(0.15, 0.6);
+            self.visible_left_ratio = self.left_ratio;
+        }
+    }
+
+    fn visible_left_ratio(&self) -> f32 {
+        self.visible_left_ratio
+    }
+
+    fn right_ratio(&self) -> f32 {
+        1.0 - self.visible_left_ratio
+    }
+
+    fn on_drag_move(
+        &mut self,
+        drag_event: &DragMoveEvent<DraggedDetailContentSplitHandle>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let bounds = drag_event.bounds;
+        let bounds_width = bounds.right() - bounds.left();
+        if bounds_width <= px(0.) {
+            return;
+        }
+
+        let new_ratio = (drag_event.event.position.x - bounds.left()) / bounds_width;
+        self.visible_left_ratio = new_ratio.clamp(0.15, 0.6);
+    }
+
+    fn commit_ratio(&mut self) {
+        self.left_ratio = self.visible_left_ratio;
+    }
+
+    fn on_double_click(&mut self) {
+        self.left_ratio = 0.2;
+        self.visible_left_ratio = 0.2;
+    }
+}
+
+actions!(
+    git_graph_next,
+    [
+        /// Focuses the search field.
+        FocusSearch,
+        /// Focuses the next git graph tab stop.
+        FocusNextTabStop,
+        /// Focuses the previous git graph tab stop.
+        FocusPreviousTabStop,
+        /// Selects a commit half a page above the current selection.
+        ScrollUp,
+        /// Selects a commit half a page below the current selection.
+        ScrollDown,
+        /// Toggles the selected commit's changed files between flat and tree views.
+        ToggleChangedFilesView,
+    ]
+);
+
+fn timestamp_format() -> &'static [BorrowedFormatItem<'static>] {
+    static FORMAT: OnceLock<Vec<BorrowedFormatItem<'static>>> = OnceLock::new();
+    FORMAT.get_or_init(|| {
+        time::format_description::parse("[day] [month repr:short] [year] [hour]:[minute]")
+            .unwrap_or_default()
+    })
+}
+
+fn format_timestamp(timestamp: i64) -> String {
+    let Ok(datetime) = OffsetDateTime::from_unix_timestamp(timestamp) else {
+        return "Unknown".to_string();
+    };
+
+    let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    let local_datetime = datetime.to_offset(local_offset);
+
+    local_datetime
+        .format(timestamp_format())
+        .unwrap_or_default()
+}
+
+fn accent_colors_count(accents: &AccentColors) -> usize {
+    accents.0.len()
+}
+
+#[derive(Copy, Clone, Debug)]
+struct BranchColor(u8);
+
+#[derive(Debug)]
+enum LaneState {
+    Empty,
+    Active {
+        child: Oid,
+        parent: Oid,
+        color: Option<BranchColor>,
+        starting_row: usize,
+        starting_col: usize,
+        destination_column: Option<usize>,
+        segments: SmallVec<[CommitLineSegment; 1]>,
+    },
+}
+
+impl LaneState {
+    fn to_commit_lines(
+        &mut self,
+        ending_row: usize,
+        lane_column: usize,
+        parent_column: usize,
+        parent_color: BranchColor,
+    ) -> Option<CommitLine> {
+        let state = std::mem::replace(self, LaneState::Empty);
+
+        match state {
+            LaneState::Active {
+                #[cfg_attr(not(test), allow(unused_variables))]
+                parent,
+                #[cfg_attr(not(test), allow(unused_variables))]
+                child,
+                color,
+                starting_row,
+                starting_col,
+                destination_column,
+                mut segments,
+            } => {
+                let final_destination = destination_column.unwrap_or(parent_column);
+                let final_color = color.unwrap_or(parent_color);
+
+                Some(CommitLine {
+                    #[cfg(test)]
+                    child,
+                    #[cfg(test)]
+                    parent,
+                    child_column: starting_col,
+                    full_interval: starting_row..ending_row,
+                    color_idx: final_color.0 as usize,
+                    segments: {
+                        match segments.last_mut() {
+                            Some(CommitLineSegment::Straight { to_row })
+                                if *to_row == usize::MAX =>
+                            {
+                                if final_destination != lane_column {
+                                    *to_row = ending_row - 1;
+
+                                    let curved_line = CommitLineSegment::Curve {
+                                        to_column: final_destination,
+                                        on_row: ending_row,
+                                        curve_kind: CurveKind::Checkout,
+                                    };
+
+                                    if *to_row == starting_row {
+                                        let last_index = segments.len() - 1;
+                                        segments[last_index] = curved_line;
+                                    } else {
+                                        segments.push(curved_line);
+                                    }
+                                } else {
+                                    *to_row = ending_row;
+                                }
+                            }
+                            Some(CommitLineSegment::Curve {
+                                on_row,
+                                to_column,
+                                curve_kind,
+                            }) if *on_row == usize::MAX => {
+                                if *to_column == usize::MAX {
+                                    *to_column = final_destination;
+                                }
+                                if matches!(curve_kind, CurveKind::Merge) {
+                                    *on_row = starting_row + 1;
+                                    if *on_row < ending_row {
+                                        if *to_column != final_destination {
+                                            segments.push(CommitLineSegment::Straight {
+                                                to_row: ending_row - 1,
+                                            });
+                                            segments.push(CommitLineSegment::Curve {
+                                                to_column: final_destination,
+                                                on_row: ending_row,
+                                                curve_kind: CurveKind::Checkout,
+                                            });
+                                        } else {
+                                            segments.push(CommitLineSegment::Straight {
+                                                to_row: ending_row,
+                                            });
+                                        }
+                                    } else if *to_column != final_destination {
+                                        segments.push(CommitLineSegment::Curve {
+                                            to_column: final_destination,
+                                            on_row: ending_row,
+                                            curve_kind: CurveKind::Checkout,
+                                        });
+                                    }
+                                } else {
+                                    *on_row = ending_row;
+                                    if *to_column != final_destination {
+                                        segments.push(CommitLineSegment::Straight {
+                                            to_row: ending_row,
+                                        });
+                                        segments.push(CommitLineSegment::Curve {
+                                            to_column: final_destination,
+                                            on_row: ending_row,
+                                            curve_kind: CurveKind::Checkout,
+                                        });
+                                    }
+                                }
+                            }
+                            Some(CommitLineSegment::Curve {
+                                on_row, to_column, ..
+                            }) => {
+                                if *on_row < ending_row {
+                                    if *to_column != final_destination {
+                                        segments.push(CommitLineSegment::Straight {
+                                            to_row: ending_row - 1,
+                                        });
+                                        segments.push(CommitLineSegment::Curve {
+                                            to_column: final_destination,
+                                            on_row: ending_row,
+                                            curve_kind: CurveKind::Checkout,
+                                        });
+                                    } else {
+                                        segments.push(CommitLineSegment::Straight {
+                                            to_row: ending_row,
+                                        });
+                                    }
+                                } else if *to_column != final_destination {
+                                    segments.push(CommitLineSegment::Curve {
+                                        to_column: final_destination,
+                                        on_row: ending_row,
+                                        curve_kind: CurveKind::Checkout,
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
+
+                        segments
+                    },
+                })
+            }
+            LaneState::Empty => None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            LaneState::Empty => true,
+            LaneState::Active { .. } => false,
+        }
+    }
+}
+
+struct CommitEntry {
+    data: Arc<InitialGraphCommitData>,
+    lane: usize,
+    color_idx: usize,
+}
+
+type ActiveLaneIdx = usize;
+
+enum AllCommitCount {
+    NotLoaded,
+    Loading(usize),
+    FullyLoaded(usize),
+}
+
+#[derive(Debug)]
+enum CurveKind {
+    Merge,
+    Checkout,
+}
+
+#[derive(Debug)]
+enum CommitLineSegment {
+    Straight {
+        to_row: usize,
+    },
+    Curve {
+        to_column: usize,
+        on_row: usize,
+        curve_kind: CurveKind,
+    },
+}
+
+#[derive(Debug)]
+struct CommitLine {
+    #[cfg(test)]
+    child: Oid,
+    #[cfg(test)]
+    parent: Oid,
+    child_column: usize,
+    full_interval: Range<usize>,
+    color_idx: usize,
+    segments: SmallVec<[CommitLineSegment; 1]>,
+}
+
+impl CommitLine {
+    fn get_first_visible_segment_idx(&self, first_visible_row: usize) -> Option<(usize, usize)> {
+        if first_visible_row > self.full_interval.end {
+            return None;
+        } else if first_visible_row <= self.full_interval.start {
+            return Some((0, self.child_column));
+        }
+
+        let mut current_column = self.child_column;
+
+        for (idx, segment) in self.segments.iter().enumerate() {
+            match segment {
+                CommitLineSegment::Straight { to_row } => {
+                    if *to_row >= first_visible_row {
+                        return Some((idx, current_column));
+                    }
+                }
+                CommitLineSegment::Curve {
+                    to_column, on_row, ..
+                } => {
+                    if *on_row >= first_visible_row {
+                        return Some((idx, current_column));
+                    }
+                    current_column = *to_column;
+                }
+            }
+        }
+
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct CommitLineKey {
+    child: Oid,
+    parent: Oid,
+}
+
+struct GraphData {
+    lane_states: SmallVec<[LaneState; 8]>,
+    lane_colors: HashMap<ActiveLaneIdx, BranchColor>,
+    parent_to_lanes: HashMap<Oid, SmallVec<[usize; 1]>>,
+    next_color: BranchColor,
+    accent_colors_count: usize,
+    commits: Vec<Rc<CommitEntry>>,
+    max_commit_count: AllCommitCount,
+    max_lanes: usize,
+    lines: Vec<Rc<CommitLine>>,
+    active_commit_lines: HashMap<CommitLineKey, usize>,
+    active_commit_lines_by_parent: HashMap<Oid, SmallVec<[usize; 1]>>,
+}
+
+impl GraphData {
+    fn new(accent_colors_count: usize) -> Self {
+        GraphData {
+            lane_states: SmallVec::default(),
+            lane_colors: HashMap::default(),
+            parent_to_lanes: HashMap::default(),
+            next_color: BranchColor(0),
+            accent_colors_count,
+            commits: Vec::default(),
+            max_commit_count: AllCommitCount::NotLoaded,
+            max_lanes: 0,
+            lines: Vec::default(),
+            active_commit_lines: HashMap::default(),
+            active_commit_lines_by_parent: HashMap::default(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.lane_states.clear();
+        self.lane_colors.clear();
+        self.parent_to_lanes.clear();
+        self.commits.clear();
+        self.lines.clear();
+        self.active_commit_lines.clear();
+        self.active_commit_lines_by_parent.clear();
+        self.next_color = BranchColor(0);
+        self.max_commit_count = AllCommitCount::NotLoaded;
+        self.max_lanes = 0;
+    }
+
+    fn first_empty_lane_idx(&mut self) -> ActiveLaneIdx {
+        self.lane_states
+            .iter()
+            .position(LaneState::is_empty)
+            .unwrap_or_else(|| {
+                self.lane_states.push(LaneState::Empty);
+                self.lane_states.len() - 1
+            })
+    }
+
+    fn get_lane_color(&mut self, lane_idx: ActiveLaneIdx) -> BranchColor {
+        let accent_colors_count = self.accent_colors_count;
+        *self.lane_colors.entry(lane_idx).or_insert_with(|| {
+            let color_idx = self.next_color;
+            self.next_color = BranchColor((self.next_color.0 + 1) % accent_colors_count as u8);
+            color_idx
+        })
+    }
+
+    fn add_commits(&mut self, commits: &[Arc<InitialGraphCommitData>]) {
+        self.commits.reserve(commits.len());
+        self.lines.reserve(commits.len() / 2);
+
+        for commit in commits.iter() {
+            let commit_row = self.commits.len();
+
+            let commit_lane = self
+                .parent_to_lanes
+                .get(&commit.sha)
+                .and_then(|lanes| lanes.iter().min().copied());
+
+            let commit_lane = commit_lane.unwrap_or_else(|| self.first_empty_lane_idx());
+
+            let commit_color = self.get_lane_color(commit_lane);
+
+            if let Some(lanes) = self.parent_to_lanes.remove(&commit.sha) {
+                for lane_column in lanes {
+                    let state = &mut self.lane_states[lane_column];
+
+                    if let LaneState::Active {
+                        starting_row,
+                        segments,
+                        ..
+                    } = state
+                    {
+                        if let Some(CommitLineSegment::Curve {
+                            to_column,
+                            curve_kind: CurveKind::Merge,
+                            ..
+                        }) = segments.first_mut()
+                        {
+                            let curve_row = *starting_row + 1;
+                            let would_overlap =
+                                if lane_column != commit_lane && curve_row < commit_row {
+                                    self.commits[curve_row..commit_row]
+                                        .iter()
+                                        .any(|c| c.lane == commit_lane)
+                                } else {
+                                    false
+                                };
+
+                            if would_overlap {
+                                *to_column = lane_column;
+                            }
+                        }
+                    }
+
+                    if let Some(commit_line) =
+                        state.to_commit_lines(commit_row, lane_column, commit_lane, commit_color)
+                    {
+                        self.lines.push(Rc::new(commit_line));
+                    }
+                }
+            }
+
+            commit
+                .parents
+                .iter()
+                .enumerate()
+                .for_each(|(parent_idx, parent)| {
+                    if parent_idx == 0 {
+                        self.lane_states[commit_lane] = LaneState::Active {
+                            parent: *parent,
+                            child: commit.sha,
+                            color: Some(commit_color),
+                            starting_col: commit_lane,
+                            starting_row: commit_row,
+                            destination_column: None,
+                            segments: smallvec![CommitLineSegment::Straight { to_row: usize::MAX }],
+                        };
+
+                        self.parent_to_lanes
+                            .entry(*parent)
+                            .or_default()
+                            .push(commit_lane);
+                    } else {
+                        let new_lane = self.first_empty_lane_idx();
+
+                        self.lane_states[new_lane] = LaneState::Active {
+                            parent: *parent,
+                            child: commit.sha,
+                            color: None,
+                            starting_col: commit_lane,
+                            starting_row: commit_row,
+                            destination_column: None,
+                            segments: smallvec![CommitLineSegment::Curve {
+                                to_column: usize::MAX,
+                                on_row: usize::MAX,
+                                curve_kind: CurveKind::Merge,
+                            },],
+                        };
+
+                        self.parent_to_lanes
+                            .entry(*parent)
+                            .or_default()
+                            .push(new_lane);
+                    }
+                });
+
+            self.max_lanes = self.max_lanes.max(self.lane_states.len());
+
+            self.commits.push(Rc::new(CommitEntry {
+                data: commit.clone(),
+                lane: commit_lane,
+                color_idx: commit_color.0 as usize,
+            }));
+        }
+
+        self.max_commit_count = AllCommitCount::Loading(self.commits.len());
+    }
+}
+
+pub fn init(cx: &mut App) {
+    cx.observe_new(|workspace: &mut workspace::Workspace, _, _| {
+        workspace.register_action_renderer(|div, workspace, _window, cx| {
+            div.when(
+                workspace.project().read(cx).active_repository(cx).is_some(),
+                |div| {
+                    let workspace = workspace.weak_handle();
+                    div.on_action(move |_: &zed_actions::git_graph_next::Open, window, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                let Some(repository) =
+                                    workspace.project().read(cx).active_repository(cx)
+                                else {
+                                    return;
+                                };
+                                let repository_snapshot = repository.read(cx);
+                                let repository_id = repository_snapshot.id;
+                                let log_source = if repository_snapshot.head_commit.is_some() {
+                                    LogSource::Branch(
+                                        repository_snapshot
+                                            .branch
+                                            .as_ref()
+                                            .map(|branch| branch.ref_name.clone())
+                                            .unwrap_or_else(|| "HEAD".into()),
+                                    )
+                                } else {
+                                    LogSource::All
+                                };
+                                let git_store = workspace.project().read(cx).git_store().clone();
+                                open_or_reuse_graph_next(
+                                    workspace,
+                                    repository_id,
+                                    git_store,
+                                    log_source,
+                                    None,
+                                    window,
+                                    cx,
+                                );
+                            })
+                            .ok();
+                    })
+                },
+            )
+        });
+    })
+    .detach();
+}
+
+pub fn open_or_reuse_graph_next(
+    workspace: &mut Workspace,
+    repo_id: RepositoryId,
+    git_store: Entity<GitStore>,
+    log_source: LogSource,
+    sha: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let existing = workspace.items_of_type::<GitGraphNext>(cx).find(|graph| {
+        let graph = graph.read(cx);
+        graph.repo_id == repo_id && graph.log_source == log_source
+    });
+
+    let git_graph = if let Some(existing) = existing {
+        workspace.activate_item(&existing, true, true, window, cx);
+        existing
+    } else {
+        let workspace_handle = workspace.weak_handle();
+        let project = workspace.project().clone();
+        let git_graph = cx.new(|cx| {
+            GitGraphNext::new(
+                repo_id,
+                git_store,
+                project,
+                workspace_handle,
+                Some(log_source),
+                window,
+                cx,
+            )
+        });
+        workspace.add_item_to_active_pane(Box::new(git_graph.clone()), None, true, window, cx);
+        git_graph
+    };
+
+    if let Some(sha) = sha {
+        cx.defer(move |cx| {
+            git_graph.update(cx, |graph, cx| {
+                graph.select_commit_by_sha(sha.as_str(), cx);
+            });
+        });
+    }
+}
+
+fn lane_center_x(bounds: Bounds<Pixels>, lane: f32) -> Pixels {
+    bounds.origin.x + LEFT_PADDING + lane * LANE_WIDTH + LANE_WIDTH / 2.0
+}
+
+fn to_row_center(
+    to_row: usize,
+    row_height: Pixels,
+    scroll_offset: Pixels,
+    bounds: Bounds<Pixels>,
+) -> Pixels {
+    bounds.origin.y + to_row as f32 * row_height + row_height / 2.0 - scroll_offset
+}
+
+fn draw_commit_circle(center_x: Pixels, center_y: Pixels, color: Hsla, window: &mut Window) {
+    let radius = COMMIT_CIRCLE_RADIUS;
+
+    let mut builder = PathBuilder::fill();
+
+    // Start at the rightmost point of the circle
+    builder.move_to(point(center_x + radius, center_y));
+
+    // Draw the circle using two arc_to calls (top half, then bottom half)
+    builder.arc_to(
+        point(radius, radius),
+        px(0.),
+        false,
+        true,
+        point(center_x - radius, center_y),
+    );
+    builder.arc_to(
+        point(radius, radius),
+        px(0.),
+        false,
+        true,
+        point(center_x + radius, center_y),
+    );
+    builder.close();
+
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, color);
+    }
+}
+
+fn compute_file_diff_stats(file: &CommitFile) -> (usize, usize) {
+    let old_text = file.old_text.as_deref().unwrap_or("");
+    let new_text = file.new_text.as_deref().unwrap_or("");
+    line_diff(old_text, new_text)
+        .iter()
+        .fold((0, 0), |(added, removed), (old_range, new_range)| {
+            (
+                added + (new_range.end - new_range.start) as usize,
+                removed + (old_range.end - old_range.start) as usize,
+            )
+        })
+}
+
+fn preferred_changed_file(diff: &CommitDiff, log_source: &LogSource) -> Option<RepoPath> {
+    match log_source {
+        LogSource::Path(path) => {
+            let path = diff.history_path.as_ref().unwrap_or(path);
+            diff.files
+                .iter()
+                .find(|file| &file.path == path)
+                .map(|file| file.path.clone())
+        }
+        _ => diff.files.first().map(|file| file.path.clone()),
+    }
+}
+
+struct GitGraphContextMenu {
+    menu: Entity<ContextMenu>,
+    position: Point<Pixels>,
+    target_entry_index: Option<usize>,
+    _subscription: Subscription,
+}
+
+struct DetailPanelCommitMessage {
+    sha: Oid,
+    message: Entity<Markdown>,
+    scroll_handle: ScrollHandle,
+}
+
+#[derive(Clone, Copy)]
+enum GitGraphNextFocus {
+    Graph,
+    Table,
+    Diff,
+}
+
+pub struct GitGraphNext {
+    focus_handle: FocusHandle,
+    last_focused_region: GitGraphNextFocus,
+    embedded_search_bar: Option<(WeakEntity<search::BufferSearchBar>, [gpui::Subscription; 2])>,
+    search_state: SearchState,
+    graph_data: GraphData,
+    git_store: Entity<GitStore>,
+    workspace: WeakEntity<Workspace>,
+    context_menu: Option<GitGraphContextMenu>,
+    table_interaction_state: Entity<TableInteractionState>,
+    column_widths: Entity<RedistributableColumnsState>,
+    /// Per-column visibility mask owned by the view (not the resize state) so columns can be
+    /// hidden regardless of whether the table is resizable. `true` means the column is hidden.
+    column_visibility: TableRow<bool>,
+    selected_entry_idx: Option<usize>,
+    comparison: Option<(Oid, Oid)>,
+    active_comparison: Option<(Oid, Oid)>,
+    hovered_entry_idx: Option<usize>,
+    graph_canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    log_source: LogSource,
+    log_order: LogOrder,
+    selected_commit_files: Vec<ChangedFileEntry>,
+    selected_commit_diff_stats: Option<(usize, usize)>,
+    selected_commit_diff_error: Option<SharedString>,
+    selected_commit_diff: Option<CommitDiff>,
+    selected_commit_view: Option<Entity<crate::git_graph_next_diff::GitGraphNextDiff>>,
+    diff_view: Option<Entity<crate::git_graph_next_diff::GitGraphNextDiff>>,
+    pending_commit_view: Option<(Option<Oid>, Oid, CommitDiff)>,
+    selected_changed_file: Option<RepoPath>,
+    pending_reveal_changed_file: Cell<bool>,
+    history_paths: HashMap<Oid, RepoPath>,
+    showing_all_diff_lines: bool,
+    _commit_diff_task: Option<Task<()>>,
+    selected_commit_message: Option<DetailPanelCommitMessage>,
+    _selected_commit_message_task: Option<Task<()>>,
+    graph_detail_split_state: Entity<GraphDetailSplitState>,
+    detail_content_split_state: Entity<DetailContentSplitState>,
+    repo_id: RepositoryId,
+    changed_files_scroll_handle: UniformListScrollHandle,
+    changed_files_view_mode: ChangedFilesViewMode,
+    changed_files_expanded_dirs: HashMap<RepoPath, bool>,
+    pending_select_sha: Option<Oid>,
+}
+
+impl GitGraphNext {
+    fn invalidate_state(&mut self, cx: &mut Context<Self>) {
+        self.clear_diff(cx);
+        self.comparison = None;
+        self.active_comparison = None;
+        self.selected_entry_idx = None;
+        self.selected_commit_diff = None;
+        self.selected_commit_files.clear();
+        self.graph_data.clear();
+        self.history_paths.clear();
+        self.search_state.matches.clear();
+        self.search_state.selected_index = None;
+        self.search_state.state.next_state();
+        self.context_menu = None;
+        cx.emit(ItemEvent::Edit);
+        cx.notify();
+    }
+
+    /// Computes the height of a single commit row in the git graph.
+    ///
+    /// The returned value is snapped to the nearest physical pixel. This is
+    /// required so that the canvas's float math and the `uniform_list` layout
+    /// (which snaps to device pixels) agree on row positions; otherwise rows
+    /// drift apart as the user scrolls when `ui_font_size` is fractional.
+    fn row_height(window: &Window, _cx: &App) -> Pixels {
+        let rem_size = window.rem_size();
+        let line_height = window.text_style().line_height_in_pixels(rem_size);
+        let raw = line_height + ROW_VERTICAL_PADDING;
+        let scale = window.scale_factor();
+
+        (raw * scale).round() / scale
+    }
+
+    fn visible_row_count(&self, window: &Window, cx: &App) -> usize {
+        let row_height = Self::row_height(window, cx);
+        let viewport_height = self
+            .table_interaction_state
+            .read(cx)
+            .scroll_handle
+            .0
+            .borrow()
+            .last_item_size
+            .map_or(window.viewport_size().height, |size| size.item.height);
+
+        ((viewport_height / row_height).ceil() as usize).min(self.graph_data.commits.len())
+    }
+
+    fn graph_canvas_content_width(&self) -> Pixels {
+        (LANE_WIDTH * self.graph_data.max_lanes.max(6) as f32) + LEFT_PADDING * 2.0
+    }
+
+    fn preview_column_fractions(&self, window: &Window, cx: &App) -> [f32; 5] {
+        let raw = self
+            .column_widths
+            .read(cx)
+            .preview_fractions(window.rem_size());
+        let fractions = redistribute_hidden_fractions(&raw, Some(&self.column_visibility));
+
+        // Hidden columns occupy no space in the layout, so report them as zero here even though
+        // the shared redistribution helper preserves their stored width for when they return.
+        let value = |idx: usize| {
+            if self.column_visibility.get(idx).copied().unwrap_or(false) {
+                0.0
+            } else {
+                fractions[idx]
+            }
+        };
+
+        let is_path_history = matches!(self.log_source, LogSource::Path(_));
+        let graph_fraction = if is_path_history { 0.0 } else { value(0) };
+        let offset = if is_path_history { 0 } else { 1 };
+
+        [
+            graph_fraction,
+            value(offset),
+            value(offset + 1),
+            value(offset + 2),
+            value(offset + 3),
+        ]
+    }
+
+    fn table_column_width_config(&self, window: &Window, cx: &App) -> ColumnWidthConfig {
+        let [_, description, date, author, commit] = self.preview_column_fractions(window, cx);
+        let table_total = description + date + author + commit;
+
+        let widths = if table_total > 0.0 {
+            vec![
+                DefiniteLength::Fraction(description / table_total),
+                DefiniteLength::Fraction(date / table_total),
+                DefiniteLength::Fraction(author / table_total),
+                DefiniteLength::Fraction(commit / table_total),
+            ]
+        } else {
+            vec![
+                DefiniteLength::Fraction(0.25),
+                DefiniteLength::Fraction(0.25),
+                DefiniteLength::Fraction(0.25),
+                DefiniteLength::Fraction(0.25),
+            ]
+        };
+
+        ColumnWidthConfig::explicit(widths)
+    }
+
+    fn graph_viewport_width(&self, window: &Window, cx: &App) -> Pixels {
+        let container = self.column_widths.read(cx).cached_container_width();
+        let graph_fraction = self.preview_column_fractions(window, cx)[0];
+        if container > px(0.) && graph_fraction > 0.0 {
+            container * graph_fraction
+        } else {
+            self.graph_canvas_content_width()
+        }
+    }
+
+    pub fn new(
+        repo_id: RepositoryId,
+        git_store: Entity<GitStore>,
+        project: Entity<project::Project>,
+        workspace: WeakEntity<Workspace>,
+        log_source: Option<LogSource>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let focus_handle = cx.focus_handle();
+        cx.on_focus(&focus_handle, window, |this, _, cx| {
+            this.last_focused_region = GitGraphNextFocus::Graph;
+            cx.notify();
+        })
+        .detach();
+
+        let accent_colors = cx.theme().accents();
+        let graph = GraphData::new(accent_colors_count(accent_colors));
+        let log_source = log_source.unwrap_or_default();
+        let log_order = LogOrder::default();
+
+        cx.subscribe(&git_store, |this, _, event, cx| match event {
+            GitStoreEvent::RepositoryUpdated(updated_repo_id, repo_event, _) => {
+                if this.repo_id == *updated_repo_id {
+                    if let Some(repository) = this.get_repository(cx) {
+                        this.on_repository_event(repository, repo_event, cx);
+                    }
+                }
+            }
+            _ => {}
+        })
+        .detach();
+
+        let search_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Search commits…", window, cx);
+            editor
+        });
+
+        cx.on_focus(&search_editor.focus_handle(cx), window, |this, _, _| {
+            this.last_focused_region = GitGraphNextFocus::Graph;
+        })
+        .detach();
+
+        let table_interaction_state = cx.new(|cx| {
+            let mut state = TableInteractionState::new(cx);
+            state.focus_handle = state.focus_handle.tab_index(1).tab_stop(true);
+            state
+        });
+
+        let table_focus_handle = table_interaction_state.read(cx).focus_handle.clone();
+        cx.on_focus(&table_focus_handle, window, |this, _, _| {
+            this.last_focused_region = GitGraphNextFocus::Table
+        })
+        .detach();
+
+        let column_widths = if matches!(log_source, LogSource::Path(_)) {
+            cx.new(|_cx| {
+                RedistributableColumnsState::new(
+                    4,
+                    vec![
+                        DefiniteLength::Fraction(0.72),
+                        DefiniteLength::Fraction(0.12),
+                        DefiniteLength::Fraction(0.1),
+                        DefiniteLength::Fraction(0.06),
+                    ],
+                    vec![
+                        TableResizeBehavior::Resizable,
+                        TableResizeBehavior::Resizable,
+                        TableResizeBehavior::Resizable,
+                        TableResizeBehavior::Resizable,
+                    ],
+                )
+            })
+        } else {
+            cx.new(|_cx| {
+                RedistributableColumnsState::new(
+                    5,
+                    vec![
+                        DefiniteLength::Fraction(0.14),
+                        DefiniteLength::Fraction(0.6192),
+                        DefiniteLength::Fraction(0.1032),
+                        DefiniteLength::Fraction(0.086),
+                        DefiniteLength::Fraction(0.0516),
+                    ],
+                    vec![
+                        TableResizeBehavior::Resizable,
+                        TableResizeBehavior::Resizable,
+                        TableResizeBehavior::Resizable,
+                        TableResizeBehavior::Resizable,
+                        TableResizeBehavior::Resizable,
+                    ],
+                )
+            })
+        };
+        let mut column_visibility = TableRow::from_element(
+            false,
+            if matches!(log_source, LogSource::Path(_)) {
+                TABLE_COLUMN_COUNT
+            } else {
+                TABLE_COLUMN_COUNT + 1
+            },
+        );
+        if !matches!(log_source, LogSource::Path(_)) {
+            column_visibility.as_mut_slice()[0] = true;
+        }
+        let mut row_height = Self::row_height(window, cx);
+
+        cx.observe_global_in::<settings::SettingsStore>(window, move |this, window, cx| {
+            let new_row_height = Self::row_height(window, cx);
+            if new_row_height != row_height {
+                // The `uniform_list` powering the table caches the item size
+                // from its last layout; invalidate it so it re-measures with
+                // the new row height on the next frame.
+                this.table_interaction_state.update(cx, |state, _cx| {
+                    state.scroll_handle.0.borrow_mut().last_item_size = None;
+                });
+                row_height = new_row_height;
+                cx.notify();
+            }
+        })
+        .detach();
+
+        let diff_view = workspace.upgrade().map(|workspace| {
+            let diff_view = cx.new(|cx| {
+                crate::git_graph_next_diff::GitGraphNextDiff::new(project, workspace, window, cx)
+            });
+            cx.observe(&diff_view, |_, _, cx| cx.notify()).detach();
+            // TabSwitcher takes focus before deactivating the item, so remember
+            // the region when focus enters it rather than when the tab changes.
+            cx.subscribe(
+                &diff_view.read(cx).editor(),
+                |this, _, event: &editor::EditorEvent, _| {
+                    if matches!(event, editor::EditorEvent::FocusedIn) {
+                        this.last_focused_region = GitGraphNextFocus::Diff;
+                    }
+                },
+            )
+            .detach();
+            diff_view
+        });
+
+        let mut this = GitGraphNext {
+            focus_handle,
+            last_focused_region: GitGraphNextFocus::Graph,
+            embedded_search_bar: None,
+            git_store,
+            search_state: SearchState {
+                case_sensitive: false,
+                editor: search_editor,
+                matches: IndexSet::default(),
+                selected_index: None,
+                state: QueryState::Empty,
+            },
+            workspace,
+            graph_data: graph,
+            _commit_diff_task: None,
+            context_menu: None,
+            table_interaction_state,
+            column_widths,
+            column_visibility,
+            selected_entry_idx: None,
+            comparison: None,
+            active_comparison: None,
+            hovered_entry_idx: None,
+            graph_canvas_bounds: Rc::new(Cell::new(None)),
+            selected_commit_files: Vec::new(),
+            selected_commit_diff_stats: None,
+            selected_commit_diff_error: None,
+            selected_commit_diff: None,
+            selected_commit_view: None,
+            diff_view,
+            pending_commit_view: None,
+            selected_changed_file: None,
+            pending_reveal_changed_file: Cell::new(false),
+            history_paths: HashMap::default(),
+            showing_all_diff_lines: false,
+            selected_commit_message: None,
+            _selected_commit_message_task: None,
+            log_source,
+            log_order,
+            graph_detail_split_state: cx.new(|_cx| GraphDetailSplitState::new()),
+            detail_content_split_state: cx.new(|_cx| DetailContentSplitState::new()),
+            repo_id,
+            changed_files_scroll_handle: UniformListScrollHandle::new(),
+            changed_files_view_mode: ChangedFilesViewMode::default(),
+            changed_files_expanded_dirs: HashMap::default(),
+            pending_select_sha: None,
+        };
+
+        this.fetch_initial_graph_data(cx);
+        this
+    }
+
+    fn on_repository_event(
+        &mut self,
+        repository: Entity<Repository>,
+        event: &RepositoryEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            RepositoryEvent::GraphEvent((source, order), event)
+                if source == &self.log_source && order == &self.log_order =>
+            {
+                match event {
+                    GitGraphEvent::FullyLoaded => {
+                        if let Some(pending_sha_index) =
+                            self.pending_select_sha.take().and_then(|oid| {
+                                repository
+                                    .read(cx)
+                                    .get_graph_data(source.clone(), *order)
+                                    .and_then(|data| data.commit_oid_to_index.get(&oid).copied())
+                            })
+                        {
+                            self.select_entry(pending_sha_index, ScrollStrategy::Nearest, cx);
+                        }
+                        let count = match self.graph_data.max_commit_count {
+                            AllCommitCount::FullyLoaded(count) | AllCommitCount::Loading(count) => {
+                                count
+                            }
+                            AllCommitCount::NotLoaded => 0,
+                        };
+                        self.graph_data.max_commit_count = AllCommitCount::FullyLoaded(count);
+                        cx.notify();
+                    }
+                    GitGraphEvent::LoadingError => {
+                        cx.notify();
+                    }
+                    GitGraphEvent::CountUpdated(commit_count) => {
+                        let old_count = self.graph_data.commits.len();
+
+                        if let Some(pending_selection_index) =
+                            repository.update(cx, |repository, cx| {
+                                let GraphDataResponse {
+                                    commits,
+                                    is_loading,
+                                    error: _,
+                                } = repository.graph_data(
+                                    source.clone(),
+                                    *order,
+                                    old_count..*commit_count,
+                                    cx,
+                                );
+                                self.graph_data.add_commits(commits);
+
+                                let pending_sha_index = self.pending_select_sha.and_then(|oid| {
+                                    repository.get_graph_data(source.clone(), *order).and_then(
+                                        |data| data.commit_oid_to_index.get(&oid).copied(),
+                                    )
+                                });
+
+                                if !is_loading && pending_sha_index.is_none() {
+                                    self.pending_select_sha.take();
+                                }
+
+                                pending_sha_index
+                            })
+                        {
+                            self.select_entry(pending_selection_index, ScrollStrategy::Nearest, cx);
+                            self.pending_select_sha.take();
+                        }
+
+                        cx.notify();
+                    }
+                }
+            }
+            RepositoryEvent::TagsChanged => {
+                self.pending_select_sha = None;
+                self.invalidate_state(cx);
+            }
+            RepositoryEvent::HeadChanged | RepositoryEvent::BranchListChanged => {
+                // Only invalidate if we scanned atleast once,
+                // meaning we are not inside the initial repo loading state
+                // NOTE: this fixes an loading performance regression
+                if repository.read(cx).scan_id > 1 {
+                    self.pending_select_sha = None;
+                    self.invalidate_state(cx);
+                }
+            }
+            RepositoryEvent::StashEntriesChanged if self.log_source == LogSource::All => {
+                // Stash entries initial's scan id is 2, so we don't want to invalidate the graph before that
+                if repository.read(cx).scan_id > 2 {
+                    self.pending_select_sha = None;
+                    self.invalidate_state(cx);
+                }
+            }
+            RepositoryEvent::GraphEvent(_, _) => {}
+            _ => {}
+        }
+    }
+
+    fn fetch_initial_graph_data(&mut self, cx: &mut App) {
+        if let Some(repository) = self.get_repository(cx) {
+            repository.update(cx, |repository, cx| {
+                let commits = repository
+                    .graph_data(self.log_source.clone(), self.log_order, 0..usize::MAX, cx)
+                    .commits;
+                self.graph_data.add_commits(commits);
+            });
+        }
+    }
+
+    fn get_repository(&self, cx: &App) -> Option<Entity<Repository>> {
+        let git_store = self.git_store.read(cx);
+        git_store.repositories().get(&self.repo_id).cloned()
+    }
+
+    /// Checks whether a ref name from git's `%D` decoration
+    ///  format refers to the currently checked-out branch.
+    fn is_head_ref(ref_name: &str, head_branch_name: &Option<SharedString>) -> bool {
+        head_branch_name.as_ref().is_some_and(|head| {
+            ref_name == head.as_ref() || ref_name.strip_prefix("HEAD -> ") == Some(head.as_ref())
+        })
+    }
+
+    /// Extracts a ref name (branch, remote ref, or tag) from a decoration in
+    /// git's `%D` format, returning `None` for a detached `HEAD`.
+    fn ref_name_from_decoration(decoration: &str) -> Option<SharedString> {
+        let name = decoration
+            .strip_prefix("tag: ")
+            .or_else(|| decoration.strip_prefix("HEAD -> "))
+            .unwrap_or(decoration);
+        if name.is_empty() || name == "HEAD" {
+            return None;
+        }
+        Some(SharedString::from(name.to_string()))
+    }
+
+    fn render_chip(
+        &self,
+        name: &SharedString,
+        accent_color: gpui::Hsla,
+        is_head: bool,
+    ) -> impl IntoElement {
+        Chip::new(name.clone())
+            .label_size(LabelSize::Small)
+            .truncate()
+            .tooltip({
+                let name = name.clone();
+                move |_, cx| Tooltip::simple(name.clone(), cx)
+            })
+            .map(|chip| {
+                if is_head {
+                    chip.icon(IconName::Check)
+                        .bg_color(accent_color.opacity(0.25))
+                        .border_color(accent_color.opacity(0.5))
+                } else {
+                    chip.bg_color(accent_color.opacity(0.08))
+                        .border_color(accent_color.opacity(0.25))
+                }
+            })
+    }
+
+    /// Renders a ref chip for the commit at `commit_idx`. Chips that name a ref
+    /// (branch, remote ref, or tag) get a right-click handler that opens a
+    /// ref-specific context menu, so that custom commands can be resolved
+    /// against the clicked ref.
+    fn render_ref_chip(
+        &self,
+        name: &SharedString,
+        accent_color: gpui::Hsla,
+        is_head: bool,
+        commit_idx: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let chip = self.render_chip(name, accent_color, is_head);
+        let Some(ref_name) = Self::ref_name_from_decoration(name) else {
+            return chip.into_any_element();
+        };
+        div()
+            .min_w_0()
+            .child(chip)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.deploy_entry_context_menu(
+                        event.position,
+                        commit_idx,
+                        Some(ref_name.clone()),
+                        window,
+                        cx,
+                    );
+                    cx.stop_propagation();
+                }),
+            )
+            .into_any_element()
+    }
+
+    fn render_table_rows(
+        &mut self,
+        range: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Vec<AnyElement>> {
+        let repository = self.get_repository(cx);
+
+        let head_branch_name: Option<SharedString> = repository.as_ref().and_then(|repo| {
+            repo.read(cx)
+                .snapshot()
+                .branch
+                .as_ref()
+                .map(|branch| SharedString::from(branch.name().to_string()))
+        });
+
+        let row_height = Self::row_height(window, cx);
+
+        // We fetch data outside the visible viewport to avoid loading entries when
+        // users scroll through the git graph
+        if let Some(repository) = repository.as_ref() {
+            const FETCH_RANGE: usize = 100;
+            repository.update(cx, |repository, cx| {
+                self.graph_data.commits[range.start.saturating_sub(FETCH_RANGE)
+                    ..(range.end + FETCH_RANGE)
+                        .min(self.graph_data.commits.len().saturating_sub(1))]
+                    .iter()
+                    .for_each(|commit| {
+                        repository.fetch_commit_data(commit.data.sha, false, cx);
+                    });
+            });
+        }
+
+        range
+            .map(|idx| {
+                let Some((commit, repository)) =
+                    self.graph_data.commits.get(idx).zip(repository.as_ref())
+                else {
+                    return vec![
+                        div().h(row_height).into_any_element(),
+                        div().h(row_height).into_any_element(),
+                        div().h(row_height).into_any_element(),
+                        div().h(row_height).into_any_element(),
+                    ];
+                };
+
+                let data = repository.update(cx, |repository, cx| {
+                    repository
+                        .fetch_commit_data(commit.data.sha, false, cx)
+                        .clone()
+                });
+
+                let short_sha = commit.data.sha.display_short();
+                let mut formatted_time = String::new();
+                let subject: SharedString;
+                let author_name: SharedString;
+
+                if let CommitDataState::Loaded(ref data) = data {
+                    subject = data.subject.clone();
+                    author_name = data.author_name.clone();
+                    formatted_time = format_timestamp(data.commit_timestamp);
+                } else {
+                    subject = "Loading…".into();
+                    author_name = "".into();
+                }
+
+                let accent_colors = cx.theme().accents();
+                let accent_color = accent_colors
+                    .0
+                    .get(commit.color_idx)
+                    .copied()
+                    .unwrap_or_else(|| accent_colors.0.first().copied().unwrap_or_default());
+
+                let comparison_role = self.comparison.and_then(|(base, target)| {
+                    if commit.data.sha == base {
+                        Some("Base")
+                    } else if commit.data.sha == target {
+                        Some("Target")
+                    } else {
+                        None
+                    }
+                });
+                let is_selected = comparison_role.is_some()
+                    || (self.comparison.is_none() && self.selected_entry_idx == Some(idx));
+                let is_matched = self.search_state.matches.contains(&commit.data.sha);
+                let column_label = |label: SharedString| {
+                    Label::new(label)
+                        .when(!is_selected, |c| c.color(Color::Muted))
+                        .truncate()
+                        .into_any_element()
+                };
+
+                let subject_label = if is_matched {
+                    let query = match &self.search_state.state {
+                        QueryState::Confirmed((query, _)) => Some(query.clone()),
+                        _ => None,
+                    };
+                    let highlight_ranges = query
+                        .and_then(|q| {
+                            let ranges = if self.search_state.case_sensitive {
+                                subject
+                                    .match_indices(q.as_str())
+                                    .map(|(start, matched)| start..start + matched.len())
+                                    .collect::<Vec<_>>()
+                            } else {
+                                let q = q.to_lowercase();
+                                let subject_lower = subject.to_lowercase();
+
+                                subject_lower
+                                    .match_indices(&q)
+                                    .filter_map(|(start, matched)| {
+                                        let end = start + matched.len();
+                                        subject.is_char_boundary(start).then_some(()).and_then(
+                                            |_| subject.is_char_boundary(end).then_some(start..end),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            };
+
+                            (!ranges.is_empty()).then_some(ranges)
+                        })
+                        .unwrap_or_default();
+                    HighlightedLabel::from_ranges(subject, highlight_ranges)
+                        .when(!is_selected, |c| c.color(Color::Muted))
+                        .truncate()
+                        .into_any_element()
+                } else {
+                    column_label(subject)
+                };
+
+                vec![
+                    div()
+                        .id(ElementId::NamedInteger("commit-subject".into(), idx as u64))
+                        .overflow_hidden()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .overflow_hidden()
+                                .children((!commit.data.ref_names.is_empty()).then(|| {
+                                    h_flex().gap_1().children(commit.data.ref_names.iter().map(
+                                        |name| {
+                                            let is_head =
+                                                Self::is_head_ref(name.as_ref(), &head_branch_name);
+                                            self.render_ref_chip(
+                                                name,
+                                                accent_color,
+                                                is_head,
+                                                idx,
+                                                cx,
+                                            )
+                                        },
+                                    ))
+                                }))
+                                .children(comparison_role.map(|role| {
+                                    Label::new(role).size(LabelSize::Small).color(Color::Accent)
+                                }))
+                                .child(subject_label),
+                        )
+                        .into_any_element(),
+                    column_label(formatted_time.into()),
+                    column_label(author_name),
+                    column_label(short_sha.into()),
+                ]
+            })
+            .collect()
+    }
+
+    fn sync_embedded_search_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let search_bar = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).pane_for_item_id(cx.entity_id()))
+            .and_then(|pane| {
+                let pane = pane.read(cx);
+                if pane
+                    .active_item()
+                    .is_none_or(|item| item.item_id() != cx.entity_id())
+                {
+                    return None;
+                }
+                pane.toolbar()
+                    .read(cx)
+                    .item_of_type::<search::BufferSearchBar>()
+            });
+        if self
+            .embedded_search_bar
+            .as_ref()
+            .map(|(bar, _)| bar.entity_id())
+            != search_bar.as_ref().map(|bar| bar.entity_id())
+        {
+            self.embedded_search_bar = search_bar.map(|bar| {
+                let subscription = cx.observe(&bar, |_, _, cx| cx.notify());
+                let focus_subscription =
+                    cx.on_focus(&bar.focus_handle(cx), window, |this, _, cx| {
+                        let active = this
+                            .workspace
+                            .upgrade()
+                            .and_then(|workspace| {
+                                workspace.read(cx).pane_for_item_id(cx.entity_id())
+                            })
+                            .and_then(|pane| pane.read(cx).active_item())
+                            .is_some_and(|item| item.item_id() == cx.entity_id());
+                        if active {
+                            this.last_focused_region = GitGraphNextFocus::Diff;
+                        }
+                    });
+                (bar.downgrade(), [subscription, focus_subscription])
+            });
+        }
+    }
+
+    fn embedded_search_is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.embedded_search_bar
+            .as_ref()
+            .and_then(|(bar, _)| bar.upgrade())
+            .is_some_and(|bar| bar.focus_handle(cx).contains_focused(window, cx))
+    }
+
+    fn diff_search_is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.diff_is_focused(window, cx) || self.embedded_search_is_focused(window, cx)
+    }
+
+    fn diff_is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.diff_view.as_ref().is_some_and(|view| {
+            let editor = view.read(cx).editor();
+            let editor = editor.read(cx);
+            editor
+                .rhs_editor()
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+                || editor
+                    .lhs_editor()
+                    .is_some_and(|editor| editor.focus_handle(cx).contains_focused(window, cx))
+        })
+    }
+
+    fn clear_diff(&mut self, cx: &mut Context<Self>) {
+        self._commit_diff_task = None;
+        self.pending_commit_view = None;
+        self.selected_commit_view = None;
+        if let Some(view) = &self.diff_view {
+            view.update(cx, |view, cx| view.clear(cx));
+        }
+    }
+
+    fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .search_state
+            .editor
+            .focus_handle(cx)
+            .contains_focused(window, cx)
+        {
+            self.focus_handle.focus(window, cx);
+            return;
+        }
+        if self.diff_search_is_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
+        self.clear_diff(cx);
+        self.comparison = None;
+        self.active_comparison = None;
+        self.selected_entry_idx = None;
+        self.selected_commit_files.clear();
+        self.selected_commit_diff_stats = None;
+        self.selected_commit_diff_error = None;
+        self.selected_commit_diff = None;
+        self.selected_commit_view = None;
+        self.pending_commit_view = None;
+        self.selected_changed_file = None;
+        self.changed_files_expanded_dirs.clear();
+        cx.emit(ItemEvent::Edit);
+        cx.notify();
+    }
+
+    fn select_first(&mut self, _: &SelectFirst, _window: &mut Window, cx: &mut Context<Self>) {
+        self.select_entry(0, ScrollStrategy::Nearest, cx);
+    }
+
+    fn select_prev(&mut self, _: &SelectPrevious, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(selected_entry_idx) = &self.selected_entry_idx {
+            self.select_entry(
+                selected_entry_idx.saturating_sub(1),
+                ScrollStrategy::Nearest,
+                cx,
+            );
+        } else {
+            self.select_first(&SelectFirst, window, cx);
+        }
+    }
+
+    fn select_next(&mut self, _: &SelectNext, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(selected_entry_idx) = &self.selected_entry_idx {
+            self.select_entry(
+                selected_entry_idx
+                    .saturating_add(1)
+                    .min(self.graph_data.commits.len().saturating_sub(1)),
+                ScrollStrategy::Nearest,
+                cx,
+            );
+        } else {
+            self.select_prev(&SelectPrevious, window, cx);
+        }
+    }
+
+    fn select_last(&mut self, _: &SelectLast, _window: &mut Window, cx: &mut Context<Self>) {
+        self.select_entry(
+            self.graph_data.commits.len().saturating_sub(1),
+            ScrollStrategy::Nearest,
+            cx,
+        );
+    }
+
+    fn scroll_up(&mut self, _: &ScrollUp, window: &mut Window, cx: &mut Context<Self>) {
+        let step = (self.visible_row_count(window, cx) / 2).max(1);
+        let target_idx = self.selected_entry_idx.unwrap_or(0).saturating_sub(step);
+
+        self.select_entry(target_idx, ScrollStrategy::Nearest, cx);
+    }
+
+    fn scroll_down(&mut self, _: &ScrollDown, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(last_entry_idx) = self.graph_data.commits.len().checked_sub(1) else {
+            return;
+        };
+
+        let step = (self.visible_row_count(window, cx) / 2).max(1);
+        let target_idx = self
+            .selected_entry_idx
+            .unwrap_or(0)
+            .saturating_add(step)
+            .min(last_entry_idx);
+
+        self.select_entry(target_idx, ScrollStrategy::Nearest, cx);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        // The global Enter binding must not consume the native/Vim search submission.
+        if self.diff_search_is_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
+        self.open_selected_commit_view(window, cx);
+    }
+
+    fn toggle_changed_files_view(
+        &mut self,
+        _: &ToggleChangedFilesView,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.changed_files_view_mode = self.changed_files_view_mode.toggled();
+        self.changed_files_scroll_handle
+            .scroll_to_item(0, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    fn search(&mut self, query: SharedString, cx: &mut Context<Self>) {
+        let Some(repo) = self.get_repository(cx) else {
+            return;
+        };
+
+        self.search_state.matches.clear();
+        self.search_state.selected_index = None;
+        self.search_state.editor.update(cx, |editor, _cx| {
+            editor.set_text_style_refinement(Default::default());
+        });
+
+        if query.as_str().is_empty() {
+            self.search_state.state = QueryState::Empty;
+            cx.notify();
+            return;
+        }
+
+        let (request_tx, request_rx) = async_channel::unbounded::<Oid>();
+
+        repo.update(cx, |repo, cx| {
+            repo.search_commits(
+                self.log_source.clone(),
+                SearchCommitArgs {
+                    query: query.clone(),
+                    case_sensitive: self.search_state.case_sensitive,
+                },
+                request_tx,
+                cx,
+            );
+        });
+
+        let search_task = cx.spawn(async move |this, cx| {
+            while let Ok(first_oid) = request_rx.recv().await {
+                let mut pending_oids = vec![first_oid];
+                while let Ok(oid) = request_rx.try_recv() {
+                    pending_oids.push(oid);
+                }
+
+                this.update(cx, |this, cx| {
+                    if this.search_state.selected_index.is_none() {
+                        this.search_state.selected_index = Some(0);
+                        this.select_commit_by_sha(first_oid, cx);
+                    }
+
+                    this.search_state.matches.extend(pending_oids);
+                    cx.notify();
+                })
+                .ok();
+            }
+
+            this.update(cx, |this, cx| {
+                if this.search_state.matches.is_empty() {
+                    this.search_state.editor.update(cx, |editor, cx| {
+                        editor.set_text_style_refinement(TextStyleRefinement {
+                            color: Some(Color::Error.color(cx)),
+                            ..Default::default()
+                        });
+                    });
+                }
+            })
+            .ok();
+        });
+
+        self.search_state.state = QueryState::Confirmed((query, search_task));
+        cx.emit(ItemEvent::Edit);
+    }
+
+    fn confirm_search(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.search_state.editor.read(cx).text(cx).into();
+        self.search(query, cx);
+    }
+
+    fn activate_search_editor_if_focused(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_state.editor.update(cx, |editor, cx| {
+            if editor.is_focused(window) {
+                editor.select_all(&Default::default(), window, cx);
+                editor.show_cursor(cx);
+            }
+        });
+    }
+
+    fn focus_next_tab_stop(
+        &mut self,
+        _: &FocusNextTabStop,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus_next(cx);
+        self.activate_search_editor_if_focused(window, cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn focus_previous_tab_stop(
+        &mut self,
+        _: &FocusPreviousTabStop,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus_prev(cx);
+        self.activate_search_editor_if_focused(window, cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn select_entry(
+        &mut self,
+        idx: usize,
+        scroll_strategy: ScrollStrategy,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_entry_with_base(idx, scroll_strategy, None, cx);
+    }
+
+    fn select_entry_with_base(
+        &mut self,
+        idx: usize,
+        scroll_strategy: ScrollStrategy,
+        base: Option<Oid>,
+        cx: &mut Context<Self>,
+    ) {
+        let comparison = base.and_then(|base| {
+            self.graph_data
+                .commits
+                .get(idx)
+                .map(|commit| (base, commit.data.sha))
+        });
+        self.comparison = comparison;
+        cx.notify();
+        if (self.selected_entry_idx == Some(idx) && self.active_comparison == comparison)
+            || idx >= self.graph_data.commits.len()
+        {
+            debug_assert!(
+                idx < self.graph_data.commits.len(),
+                "attempted to select out of bounds index: {idx}, commits.len: {}",
+                self.graph_data.commits.len()
+            );
+            return;
+        }
+
+        self.clear_diff(cx);
+        self.active_comparison = comparison;
+        self.context_menu = None;
+        self.selected_entry_idx = Some(idx);
+        self.selected_commit_files.clear();
+        self.selected_commit_diff_stats = None;
+        self.selected_commit_diff_error = None;
+        self.selected_commit_diff = None;
+        self.selected_commit_view = None;
+        self.pending_commit_view = None;
+        self.selected_changed_file = None;
+        self.selected_commit_message = None;
+        self._selected_commit_message_task = None;
+        self.changed_files_expanded_dirs.clear();
+        self.changed_files_scroll_handle
+            .scroll_to_item(0, ScrollStrategy::Top);
+        self.table_interaction_state.update(cx, |state, cx| {
+            state.scroll_handle.scroll_to_item(idx, scroll_strategy);
+            cx.notify();
+        });
+
+        let Some(commit) = self.graph_data.commits.get(idx) else {
+            return;
+        };
+
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+
+        let commit_message_handle = commit.data.sha;
+        let selected_sha = commit.data.sha;
+        let diff_handle = selected_sha.to_string();
+
+        self.load_selected_commit_message(cx, &commit_message_handle, &repository);
+
+        let repository_id = self.repo_id;
+        let log_source = self.log_source.clone();
+        let history_path = match &log_source {
+            LogSource::Path(path) if base.is_none() => Some(
+                self.history_paths
+                    .get(&selected_sha)
+                    .unwrap_or(path)
+                    .clone(),
+            ),
+            _ => None,
+        };
+        let diff_receiver = repository.update(cx, |repo, cx| {
+            repo.load_commit_diff_with_base(
+                diff_handle,
+                base.map(|sha| sha.to_string()),
+                false,
+                history_path,
+                cx,
+            )
+        });
+
+        self._commit_diff_task = Some(cx.spawn(async move |this, cx| {
+            let diff = diff_receiver.await;
+            this.update(cx, |this, cx| {
+                let is_still_selected = this
+                    .selected_entry_idx
+                    .and_then(|idx| this.graph_data.commits.get(idx))
+                    .is_some_and(|commit| commit.data.sha == selected_sha);
+                if !is_still_selected
+                    || this.active_comparison != comparison
+                    || this.repo_id != repository_id
+                    || this.log_source != log_source
+                {
+                    return;
+                }
+
+                match diff {
+                    Ok(diff) => {
+                        if let Some(path) = diff.history_path.as_ref() {
+                            this.history_paths.insert(selected_sha, path.clone());
+                        }
+                        this.selected_commit_files = diff
+                            .files
+                            .iter()
+                            .map(|file| ChangedFileEntry::from_commit_file(file, cx))
+                            .collect();
+                        this.selected_commit_diff_stats = Some(
+                            this.selected_commit_files
+                                .iter()
+                                .filter_map(|file| file.diff_stats)
+                                .fold((0, 0), |(added, removed), (file_added, file_removed)| {
+                                    (added + file_added, removed + file_removed)
+                                }),
+                        );
+                        this.selected_changed_file = preferred_changed_file(&diff, &log_source)
+                            .or_else(|| comparison.and_then(|_| diff.files.first().map(|file| file.path.clone())));
+                        this.pending_reveal_changed_file.set(true);
+                        this.selected_commit_diff = Some(diff);
+                        if this.selected_changed_file.is_some() {
+                            this.queue_selected_commit_view(selected_sha, cx);
+                        }
+                    }
+                    Err(error) => {
+                        this.selected_commit_diff_error = Some(error.to_string().into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+
+        cx.emit(ItemEvent::Edit);
+        cx.notify();
+    }
+
+    fn load_selected_commit_message(
+        &mut self,
+        cx: &mut Context<'_, Self>,
+        sha: &Oid,
+        repository: &Entity<Repository>,
+    ) {
+        if self
+            .selected_commit_message
+            .as_ref()
+            .is_some_and(|old| old.sha == *sha)
+        {
+            return;
+        }
+
+        self._selected_commit_message_task = None;
+        match repository.update(cx, |repo, cx| {
+            repo.fetch_commit_data(*sha, true, cx).clone()
+        }) {
+            CommitDataState::Loaded(commit_data) => {
+                self.set_selected_commit_message(cx, commit_data.sha, commit_data.message.clone());
+            }
+            CommitDataState::Loading(Some(receiver)) => {
+                self._selected_commit_message_task = Some(cx.spawn(async move |this, cx| {
+                    if let Ok(commit_data) = receiver.await {
+                        this.update(cx, |this, cx| {
+                            this.set_selected_commit_message(
+                                cx,
+                                commit_data.sha,
+                                commit_data.message.clone(),
+                            );
+                        })
+                        .log_err();
+                    }
+                }))
+            }
+            _ => {
+                debug_panic!(
+                    "Fetched commit data asynchronously, but was not given a listener or cached commit data."
+                );
+            }
+        };
+    }
+
+    fn set_selected_commit_message(
+        &mut self,
+        cx: &mut Context<'_, GitGraphNext>,
+        sha: Oid,
+        message: SharedString,
+    ) {
+        let languages = self
+            .workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.project().read(cx).languages().clone()
+            })
+            .log_err();
+        self.selected_commit_message = Some(DetailPanelCommitMessage {
+            sha,
+            message: cx.new(|cx| Markdown::new(message, languages, None, cx)),
+            scroll_handle: ScrollHandle::new(),
+        });
+        self._selected_commit_message_task = None;
+        cx.notify();
+    }
+
+    fn select_previous_match(&mut self, cx: &mut Context<Self>) {
+        if self.search_state.matches.is_empty() {
+            return;
+        }
+
+        let mut prev_selection = self.search_state.selected_index.unwrap_or_default();
+
+        if prev_selection == 0 {
+            prev_selection = self.search_state.matches.len() - 1;
+        } else {
+            prev_selection -= 1;
+        }
+
+        let Some(&oid) = self.search_state.matches.get_index(prev_selection) else {
+            return;
+        };
+
+        self.search_state.selected_index = Some(prev_selection);
+        self.select_commit_by_sha(oid, cx);
+    }
+
+    fn select_next_match(&mut self, cx: &mut Context<Self>) {
+        if self.search_state.matches.is_empty() {
+            return;
+        }
+
+        let mut next_selection = self
+            .search_state
+            .selected_index
+            .map(|index| index + 1)
+            .unwrap_or_default();
+
+        if next_selection >= self.search_state.matches.len() {
+            next_selection = 0;
+        }
+
+        let Some(&oid) = self.search_state.matches.get_index(next_selection) else {
+            return;
+        };
+
+        self.search_state.selected_index = Some(next_selection);
+        self.select_commit_by_sha(oid, cx);
+    }
+
+    fn set_log_source(&mut self, log_source: LogSource, cx: &mut Context<Self>) {
+        if self.log_source == log_source {
+            return;
+        }
+
+        self.clear_diff(cx);
+        self.comparison = None;
+        self.active_comparison = None;
+        self.selected_entry_idx = None;
+        self.selected_commit_files.clear();
+        self.selected_commit_diff_stats = None;
+        self.selected_commit_diff_error = None;
+        self.selected_commit_diff = None;
+        self.selected_commit_view = None;
+        self.pending_commit_view = None;
+        self.selected_changed_file = None;
+        self.selected_commit_message = None;
+        self._selected_commit_message_task = None;
+        self._commit_diff_task = None;
+        self.changed_files_expanded_dirs.clear();
+        self.pending_select_sha = None;
+        self.log_source = log_source;
+
+        if self.column_visibility.cols() == TABLE_COLUMN_COUNT + 1
+            && let Some(graph_column) = self.column_visibility.as_mut_slice().first_mut()
+        {
+            *graph_column = matches!(self.log_source, LogSource::Branch(_));
+        }
+
+        self.invalidate_state(cx);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn log_source_for_test(&self) -> &LogSource {
+        &self.log_source
+    }
+
+    pub fn set_repo_id(&mut self, repo_id: RepositoryId, cx: &mut Context<Self>) {
+        if repo_id != self.repo_id
+            && self
+                .git_store
+                .read(cx)
+                .repositories()
+                .contains_key(&repo_id)
+        {
+            self.repo_id = repo_id;
+            self.invalidate_state(cx);
+        }
+    }
+
+    pub fn select_commit_by_sha(&mut self, sha: impl TryInto<Oid>, cx: &mut Context<Self>) {
+        fn inner(this: &mut GitGraphNext, oid: Oid, cx: &mut Context<GitGraphNext>) {
+            let Some(selected_repository) = this.get_repository(cx) else {
+                return;
+            };
+
+            let Some(index) = selected_repository
+                .read(cx)
+                .get_graph_data(this.log_source.clone(), this.log_order)
+                .and_then(|data| data.commit_oid_to_index.get(&oid))
+                .copied()
+            else {
+                this.pending_select_sha = Some(oid);
+                return;
+            };
+
+            this.pending_select_sha = None;
+            this.select_entry(index, ScrollStrategy::Center, cx);
+        }
+
+        if let Ok(oid) = sha.try_into() {
+            inner(self, oid, cx);
+        }
+    }
+
+    fn queue_selected_commit_view(&mut self, sha: Oid, cx: &mut Context<Self>) {
+        let Some(path) = self.selected_changed_file.as_ref() else {
+            return;
+        };
+        let Some(file) = self
+            .selected_commit_diff
+            .as_ref()
+            .and_then(|diff| diff.files.iter().find(|file| &file.path == path))
+        else {
+            return;
+        };
+
+        self.selected_commit_view = None;
+        self.pending_commit_view = Some((
+            self.active_comparison.map(|(base, _)| base),
+            sha,
+            CommitDiff {
+                files: vec![CommitFile {
+                    path: file.path.clone(),
+                    old_text: file.old_text.clone(),
+                    new_text: file.new_text.clone(),
+                    is_binary: file.is_binary,
+                }],
+                is_shallow_boundary: self
+                    .selected_commit_diff
+                    .as_ref()
+                    .is_some_and(|diff| diff.is_shallow_boundary),
+                history_path: None,
+            },
+        ));
+        if let Some(view) = &self.diff_view {
+            view.update(cx, |view, cx| view.clear(cx));
+        }
+    }
+
+    fn select_changed_file(
+        &mut self,
+        repo_path: RepoPath,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_changed_file = Some(repo_path);
+        if let Some(sha) = self
+            .selected_entry_idx
+            .and_then(|idx| self.graph_data.commits.get(idx))
+            .map(|commit| commit.data.sha)
+        {
+            self.queue_selected_commit_view(sha, cx);
+        }
+        cx.notify();
+    }
+
+    fn deploy_changed_path_context_menu(
+        &mut self,
+        path: RepoPath,
+        is_directory: bool,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sha) = self
+            .selected_entry_idx
+            .and_then(|index| self.graph_data.commits.get(index))
+            .map(|commit| commit.data.sha)
+        else {
+            return;
+        };
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        if !is_directory {
+            self.select_changed_file(path.clone(), window, cx);
+        }
+        let repository_id = self.repo_id;
+        let project = workspace.read(cx).project().clone();
+        let project_path = repository.read(cx).repo_path_to_project_path(&path, cx);
+        let entry_id = project_path.as_ref().and_then(|path| {
+            project
+                .read(cx)
+                .entry_for_path(path, cx)
+                .and_then(|entry| (entry.is_dir() == is_directory).then_some(entry.id))
+        });
+        let absolute_path = repository
+            .read(cx)
+            .repo_path_to_abs_path(&path)
+            .to_string_lossy()
+            .into_owned();
+        let relative_path = path.as_unix_str().to_owned();
+        let graph = cx.weak_entity();
+        let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
+            let mut menu = menu.context(self.focus_handle.clone());
+            if is_directory {
+                let expanded = self
+                    .changed_files_expanded_dirs
+                    .get(&path)
+                    .copied()
+                    .unwrap_or(true);
+                for (label, expanded, recursive) in [
+                    (
+                        if expanded {
+                            "Collapse Folder"
+                        } else {
+                            "Expand Folder"
+                        },
+                        !expanded,
+                        false,
+                    ),
+                    ("Expand Recursively", true, true),
+                    ("Collapse Recursively", false, true),
+                ] {
+                    let graph = graph.clone();
+                    let path = path.clone();
+                    menu = menu.entry(label, None, move |_, cx| {
+                        graph
+                            .update(cx, |graph, cx| {
+                                if graph.repo_id != repository_id
+                                    || !graph
+                                        .selected_entry_idx
+                                        .and_then(|index| graph.graph_data.commits.get(index))
+                                        .is_some_and(|commit| commit.data.sha == sha)
+                                {
+                                    return;
+                                }
+                                set_changed_directory_expanded(
+                                    &graph.selected_commit_files,
+                                    &mut graph.changed_files_expanded_dirs,
+                                    &path,
+                                    expanded,
+                                    recursive,
+                                );
+                                cx.notify();
+                            })
+                            .log_err();
+                    });
+                }
+                menu = menu.separator();
+            }
+            menu = menu.item(
+                ui::ContextMenuEntry::new("Reveal In Project Panel")
+                    .disabled(entry_id.is_none())
+                    .handler(move |_, cx| {
+                        if let Some(entry_id) = entry_id {
+                            project.update(cx, |_, cx| {
+                                cx.emit(project::Event::RevealInProjectPanel(entry_id));
+                            });
+                        }
+                    }),
+            );
+            if !is_directory {
+                menu = menu.item(
+                    ui::ContextMenuEntry::new("Open Source File")
+                        .disabled(entry_id.is_none())
+                        .handler({
+                            let workspace = workspace.downgrade();
+                            let project_path = project_path.clone();
+                            move |window, cx| {
+                                let Some(path) = project_path.clone() else {
+                                    return;
+                                };
+                                workspace
+                                    .update(cx, |workspace_view, cx| {
+                                        let task =
+                                            workspace_view.open_path(path, None, true, window, cx);
+                                        workspace::notifications::NotifyTaskExt::detach_and_notify_err(
+                                            task, workspace.clone(), window, cx,
+                                        );
+                                    })
+                                    .log_err();
+                            }
+                        }),
+                );
+            }
+            if !is_directory {
+                menu = menu.entry("View File History", None, {
+                    let workspace = workspace.downgrade();
+                    let git_store = self.git_store.clone();
+                    let path = path.clone();
+                    move |window, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                open_or_reuse_graph_next(
+                                    workspace,
+                                    repository_id,
+                                    git_store.clone(),
+                                    LogSource::Path(path.clone()),
+                                    Some(sha.to_string()),
+                                    window,
+                                    cx,
+                                );
+                            })
+                            .log_err();
+                    }
+                });
+            }
+            menu = menu
+                .separator()
+                .entry("Copy Path", None, move |_, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(absolute_path.clone()));
+                })
+                .entry("Copy Relative Path", None, move |_, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(relative_path.clone()));
+                });
+            if is_directory {
+                let paths = changed_paths_in_directory(&self.selected_commit_files, &path)
+                    .iter()
+                    .map(|path| path.as_unix_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                menu = menu.entry("Copy Changed File Paths", None, move |_, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(paths.clone()));
+                });
+            }
+            menu
+        });
+        self.set_context_menu(context_menu, position, None, window, cx);
+    }
+
+    fn toggle_showing_all_diff_lines(&mut self, cx: &mut Context<Self>) {
+        self.showing_all_diff_lines = !self.showing_all_diff_lines;
+        if let Some(view) = &self.diff_view {
+            view.update(cx, |view, cx| {
+                view.set_showing_all_lines(self.showing_all_diff_lines, cx)
+            });
+        }
+        cx.notify();
+    }
+
+    fn open_selected_commit_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_comparison.is_some() {
+            return;
+        }
+        let Some(selected_entry_index) = self.selected_entry_idx else {
+            return;
+        };
+
+        self.open_commit_view(selected_entry_index, window, cx);
+    }
+
+    fn open_commit_view(
+        &mut self,
+        entry_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(commit_entry) = self.graph_data.commits.get(entry_index) else {
+            return;
+        };
+
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+
+        CommitView::open(
+            commit_entry.data.sha.to_string(),
+            repository.downgrade(),
+            self.workspace.clone(),
+            None,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    fn copy_commit_sha(&mut self, entry_index: usize, cx: &mut Context<Self>) {
+        let Some(commit) = self.graph_data.commits.get(entry_index) else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(commit.data.sha.to_string()));
+    }
+
+    fn copy_selected_commit_sha(
+        &mut self,
+        _: &CopyCommitSha,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selected_entry_index) = self.selected_entry_idx else {
+            return;
+        };
+        self.copy_commit_sha(selected_entry_index, cx);
+    }
+
+    fn copy_commit_tag(&mut self, entry_index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(commit) = self.graph_data.commits.get(entry_index) else {
+            return;
+        };
+
+        let tag_names = commit
+            .data
+            .tag_names()
+            .into_iter()
+            .map(|tag_name| SharedString::from(tag_name.to_string()))
+            .collect::<Vec<_>>();
+
+        match tag_names.as_slice() {
+            [] => {}
+            [tag_name] => cx.write_to_clipboard(ClipboardItem::new_string(tag_name.to_string())),
+            _ => {
+                self.workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.toggle_modal(window, cx, |window, cx| {
+                            CommitTagPicker::new(tag_names, window, cx)
+                        });
+                    })
+                    .ok();
+            }
+        }
+    }
+
+    fn copy_selected_commit_tag(
+        &mut self,
+        _: &CopyCommitTag,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selected_entry_index) = self.selected_entry_idx else {
+            return;
+        };
+        self.copy_commit_tag(selected_entry_index, window, cx);
+    }
+
+    fn deploy_entry_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        index: usize,
+        ref_name: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(commit) = self.graph_data.commits.get(index) else {
+            return;
+        };
+        if ref_name.is_none()
+            && let Some((base, target)) = self.comparison
+            && (commit.data.sha == base || commit.data.sha == target)
+        {
+            let graph = cx.weak_entity();
+            let repository_id = self.repo_id;
+            let menu = ContextMenu::build(window, cx, |menu, _, _| {
+                menu.context(self.focus_handle.clone())
+                    .header("Compare Commits")
+                    .entry(
+                        format!(
+                            "Compare {} → {}",
+                            base.display_short(),
+                            target.display_short()
+                        ),
+                        None,
+                        move |_, cx| {
+                            graph
+                                .update(cx, |graph, cx| {
+                                    if graph.repo_id != repository_id
+                                        || graph.comparison != Some((base, target))
+                                    {
+                                        return;
+                                    }
+                                    if let Some(index) = graph
+                                        .graph_data
+                                        .commits
+                                        .iter()
+                                        .position(|commit| commit.data.sha == target)
+                                    {
+                                        graph.select_entry_with_base(
+                                            index,
+                                            ScrollStrategy::Nearest,
+                                            Some(base),
+                                            cx,
+                                        );
+                                    }
+                                })
+                                .log_err();
+                        },
+                    )
+            });
+            self.set_context_menu(menu, position, Some(index), window, cx);
+            return;
+        }
+        let repository = self
+            .get_repository(cx)
+            .map(|repository| repository.downgrade());
+        let context_menu = commit_context_menu(
+            CommitContextMenuData {
+                sha: commit.data.sha,
+                tag_names: commit
+                    .data
+                    .tag_names()
+                    .into_iter()
+                    .map(|tag_name| SharedString::from(tag_name.to_string()))
+                    .collect(),
+            },
+            CommitContextMenuSource::GitGraph,
+            ref_name,
+            self.focus_handle.clone(),
+            repository,
+            self.workspace.clone(),
+            window,
+            cx,
+        );
+        self.set_context_menu(context_menu, position, Some(index), window, cx);
+    }
+
+    fn set_context_menu(
+        &mut self,
+        context_menu: Entity<ContextMenu>,
+        position: Point<Pixels>,
+        target_entry_index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&context_menu.focus_handle(cx), cx);
+
+        let subscription = cx.subscribe_in(
+            &context_menu,
+            window,
+            |this, _, _: &DismissEvent, window, cx| {
+                if this.context_menu.as_ref().is_some_and(|context_menu| {
+                    context_menu
+                        .menu
+                        .focus_handle(cx)
+                        .contains_focused(window, cx)
+                }) {
+                    cx.focus_self(window);
+                }
+                this.context_menu.take();
+                cx.notify();
+            },
+        );
+        self.context_menu = Some(GitGraphContextMenu {
+            menu: context_menu,
+            position,
+            target_entry_index,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn toggle_column_visibility(&mut self, col_idx: usize, cx: &mut Context<Self>) {
+        if col_idx == 0 && matches!(self.log_source, LogSource::Branch(_)) {
+            return;
+        }
+        if let Some(slot) = self.column_visibility.as_mut_slice().get_mut(col_idx) {
+            *slot = !*slot;
+            // Column visibility is persisted per item, so schedule a workspace serialization.
+            cx.emit(ItemEvent::Edit);
+        }
+    }
+
+    fn deploy_header_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_path_history = matches!(self.log_source, LogSource::Path(_));
+        let is_branch_filtered = matches!(self.log_source, LogSource::Branch(_));
+        let columns: &[&str] = if is_path_history {
+            &["Description", "Date", "Author", "Commit"]
+        } else {
+            &["Graph", "Description", "Date", "Author", "Commit"]
+        };
+
+        let filter = self.column_visibility.clone();
+        let visible_count = filter
+            .as_slice()
+            .iter()
+            .filter(|filtered| !**filtered)
+            .count();
+
+        let focus_handle = self.focus_handle.clone();
+        let git_graph = cx.entity();
+        let context_menu = ContextMenu::build(window, cx, |mut context_menu, _window, _cx| {
+            context_menu = context_menu.context(focus_handle).header("Columns");
+            for (col_idx, label) in columns.iter().enumerate() {
+                let is_visible = !filter.get(col_idx).copied().unwrap_or(false);
+                // Disable hiding the last remaining visible column and showing the graph while
+                // a branch filter is active.
+                let can_toggle =
+                    (!is_visible || visible_count > 1) && !(is_branch_filtered && col_idx == 0);
+                let git_graph = git_graph.clone();
+                context_menu = context_menu.toggleable_entry_disabled_when(
+                    label.to_string(),
+                    is_visible,
+                    !can_toggle,
+                    IconPosition::End,
+                    None,
+                    move |_window, cx| {
+                        git_graph.update(cx, |this, cx| {
+                            this.toggle_column_visibility(col_idx, cx);
+                            cx.notify();
+                        });
+                    },
+                );
+            }
+            context_menu
+        });
+
+        self.set_context_menu(context_menu, position, None, window, cx);
+    }
+
+    fn render_branch_filter(&self, cx: &mut Context<Self>) -> AnyElement {
+        if matches!(self.log_source, LogSource::Path(_)) {
+            return Empty.into_any_element();
+        }
+
+        let repository = self.get_repository(cx);
+        let selected_branch = match &self.log_source {
+            LogSource::Branch(branch) => Some(branch.clone()),
+            _ => None,
+        };
+        let label = selected_branch
+            .as_ref()
+            .and_then(|selected| {
+                repository.as_ref().and_then(|repository| {
+                    repository
+                        .read(cx)
+                        .branch_list
+                        .iter()
+                        .find(|branch| branch.ref_name == *selected)
+                        .map(|branch| SharedString::from(branch.name().to_string()))
+                })
+            })
+            .or_else(|| {
+                selected_branch.as_ref().map(|branch| {
+                    if branch.as_ref() == "HEAD"
+                        && let Some(commit) = repository
+                            .as_ref()
+                            .and_then(|repository| repository.read(cx).head_commit.as_ref())
+                    {
+                        return format!(
+                            "HEAD · {}",
+                            commit
+                                .sha
+                                .chars()
+                                .take(git::SHORT_SHA_LENGTH)
+                                .collect::<String>()
+                        )
+                        .into();
+                    }
+                    SharedString::from(
+                        branch
+                            .strip_prefix("refs/heads/")
+                            .or_else(|| branch.strip_prefix("refs/remotes/"))
+                            .unwrap_or(branch)
+                            .to_string(),
+                    )
+                })
+            })
+            .unwrap_or_else(|| "All Branches".into());
+        let workspace = self.workspace.clone();
+        let graph = cx.weak_entity();
+        let is_branch_selected = selected_branch.is_some();
+
+        h_flex()
+            .gap_0p5()
+            .child(
+                ui::PopoverMenu::new("git-graph-branch-filter")
+                    .menu(move |window, cx| {
+                        let graph = graph.clone();
+                        let on_select = std::sync::Arc::new(
+                            move |branch: git::repository::Branch,
+                                  _window: &mut Window,
+                                  cx: &mut App| {
+                                graph
+                                    .update(cx, |graph, cx| {
+                                        graph.set_log_source(
+                                            LogSource::Branch(branch.ref_name.clone()),
+                                            cx,
+                                        );
+                                    })
+                                    .ok();
+                            },
+                        );
+                        Some(crate::branch_picker::select_popover(
+                            workspace.clone(),
+                            repository.clone(),
+                            selected_branch.clone(),
+                            on_select,
+                            window,
+                            cx,
+                        ))
+                    })
+                    .trigger_with_tooltip(
+                        Button::new("git-graph-branch-filter-trigger", label)
+                            .start_icon(
+                                Icon::new(IconName::GitBranch)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .end_icon(
+                                Icon::new(IconName::ChevronDown)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                        Tooltip::text("Filter Commits by Branch"),
+                    ),
+            )
+            .children(is_branch_selected.then(|| {
+                IconButton::new("git-graph-clear-branch-filter", IconName::Close)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Show All Branches"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_log_source(LogSource::All, cx);
+                    }))
+            }))
+            .into_any_element()
+    }
+
+    fn render_search_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let branch_filter = self.render_branch_filter(cx);
+        let color = cx.theme().colors();
+        let query_focus_handle = self
+            .search_state
+            .editor
+            .focus_handle(cx)
+            .tab_index(1)
+            .tab_stop(true);
+
+        h_flex()
+            .key_context("GitGraphSearchBar")
+            .tab_index(1)
+            .tab_group()
+            .tab_stop(false)
+            .w_full()
+            .p_1p5()
+            .gap_1p5()
+            .border_b_1()
+            .border_color(color.border_variant)
+            .child(branch_filter)
+            .child(
+                h_flex()
+                    .h_8()
+                    .flex_1()
+                    .min_w_0()
+                    .px_1p5()
+                    .gap_1()
+                    .track_focus(&query_focus_handle)
+                    .border_1()
+                    .border_color(color.border_variant)
+                    .rounded_md()
+                    .bg(color.toolbar_background)
+                    .on_action(cx.listener(Self::confirm_search))
+                    .on_action(cx.listener(|this, _: &editor::actions::Cancel, window, cx| {
+                        this.focus_handle.focus(window, cx);
+                    }))
+                    .child(self.search_state.editor.clone())
+                    .child({
+                        let focus_handle = query_focus_handle.clone();
+                        IconButton::new("git-graph-search-case-sensitive", IconName::CaseSensitive)
+                            .shape(ui::IconButtonShape::Square)
+                            .toggle_state(self.search_state.case_sensitive)
+                            .on_click({
+                                let focus_handle = query_focus_handle.clone();
+                                move |_, window, cx| {
+                                    if !focus_handle.is_focused(window) {
+                                        window.focus(&focus_handle, cx);
+                                    }
+                                    window.dispatch_action(ToggleCaseSensitive.boxed_clone(), cx);
+                                }
+                            })
+                            .tooltip(move |_window, cx| {
+                                Tooltip::for_action_in(
+                                    "Match Case Sensitivity",
+                                    &ToggleCaseSensitive,
+                                    &focus_handle,
+                                    cx,
+                                )
+                            })
+                    }),
+            )
+            .child(
+                h_flex()
+                    .min_w_64()
+                    .gap_1()
+                    .child({
+                        let focus_handle = self.focus_handle.clone();
+                        IconButton::new("git-graph-search-prev", IconName::ChevronLeft)
+                            .shape(ui::IconButtonShape::Square)
+                            .icon_size(IconSize::Small)
+                            .tooltip(move |_, cx| {
+                                Tooltip::for_action_in(
+                                    "Select Previous Match",
+                                    &SelectPreviousMatch,
+                                    &focus_handle,
+                                    cx,
+                                )
+                            })
+                            .map(|this| {
+                                if self.search_state.matches.is_empty() {
+                                    this.disabled(true)
+                                } else {
+                                    this.disabled(false).on_click(cx.listener(|this, _, _, cx| {
+                                        this.select_previous_match(cx);
+                                    }))
+                                }
+                            })
+                    })
+                    .child({
+                        let focus_handle = self.focus_handle.clone();
+                        IconButton::new("git-graph-search-next", IconName::ChevronRight)
+                            .shape(ui::IconButtonShape::Square)
+                            .icon_size(IconSize::Small)
+                            .tooltip(move |_, cx| {
+                                Tooltip::for_action_in(
+                                    "Select Next Match",
+                                    &SelectNextMatch,
+                                    &focus_handle,
+                                    cx,
+                                )
+                            })
+                            .map(|this| {
+                                if self.search_state.matches.is_empty() {
+                                    this.disabled(true)
+                                } else {
+                                    this.disabled(false).on_click(cx.listener(|this, _, _, cx| {
+                                        this.select_next_match(cx);
+                                    }))
+                                }
+                            })
+                    })
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .child(
+                                Label::new(format!(
+                                    "{}/{}",
+                                    self.search_state
+                                        .selected_index
+                                        .map(|index| index + 1)
+                                        .unwrap_or(0),
+                                    self.search_state.matches.len()
+                                ))
+                                .size(LabelSize::Small)
+                                .when(self.search_state.matches.is_empty(), |this| {
+                                    this.color(Color::Disabled)
+                                }),
+                            )
+                            .when(
+                                matches!(
+                                    &self.search_state.state,
+                                    QueryState::Confirmed((_, task)) if !task.is_ready()
+                                ),
+                                |this| {
+                                    this.child(
+                                        Icon::new(IconName::ArrowCircle)
+                                            .color(Color::Accent)
+                                            .size(IconSize::Small)
+                                            .with_rotate_animation(2)
+                                            .into_any_element(),
+                                    )
+                                },
+                            ),
+                    ),
+            )
+    }
+
+    fn render_loading_spinner(&self, cx: &App) -> AnyElement {
+        let rems = TextSize::Large.rems(cx);
+        Icon::new(IconName::LoadCircle)
+            .size(IconSize::Custom(rems))
+            .color(Color::Accent)
+            .with_rotate_animation(3)
+            .into_any_element()
+    }
+
+    fn initialize_pending_commit_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((base, sha, diff)) = self.pending_commit_view.take() else {
+            return;
+        };
+        let is_still_selected = self
+            .selected_entry_idx
+            .and_then(|idx| self.graph_data.commits.get(idx))
+            .is_some_and(|commit| commit.data.sha == sha);
+        if !is_still_selected || self.active_comparison != base.map(|base| (base, sha)) {
+            return;
+        }
+
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = workspace.read(cx).project().clone();
+        let Some(diff_view) = self.diff_view.clone() else {
+            return;
+        };
+        diff_view.update(cx, |view, cx| {
+            view.load(
+                sha,
+                diff,
+                self.showing_all_diff_lines,
+                repository,
+                project,
+                window,
+                cx,
+            );
+        });
+        self.selected_commit_view = Some(diff_view);
+    }
+
+    fn render_commit_detail_panel(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let Some(selected_idx) = self.selected_entry_idx else {
+            return Empty.into_any_element();
+        };
+
+        let Some(commit_entry) = self.graph_data.commits.get(selected_idx) else {
+            return Empty.into_any_element();
+        };
+
+        let Some(repository) = self.get_repository(cx) else {
+            return Empty.into_any_element();
+        };
+
+        let data = repository.update(cx, |repository, cx| {
+            repository
+                .fetch_commit_data(commit_entry.data.sha, false, cx)
+                .clone()
+        });
+
+        let full_sha: SharedString = commit_entry.data.sha.to_string().into();
+        let ref_names = commit_entry.data.ref_names.clone();
+
+        let head_branch_name: Option<SharedString> = repository
+            .read(cx)
+            .snapshot()
+            .branch
+            .as_ref()
+            .map(|branch| SharedString::from(branch.name().to_string()));
+
+        let accent_colors = cx.theme().accents();
+        let accent_color = accent_colors
+            .0
+            .get(commit_entry.color_idx)
+            .copied()
+            .unwrap_or_else(|| accent_colors.0.first().copied().unwrap_or_default());
+
+        let (author_name, author_email, commit_timestamp) = match &data {
+            CommitDataState::Loaded(data) => (
+                data.author_name.clone(),
+                data.author_email.clone(),
+                Some(data.commit_timestamp),
+            ),
+            CommitDataState::Loading(_) => ("Loading…".into(), "".into(), None),
+        };
+
+        let date_string = commit_timestamp
+            .and_then(|ts| OffsetDateTime::from_unix_timestamp(ts).ok())
+            .map(|datetime| {
+                let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+                let local_datetime = datetime.to_offset(local_offset);
+                let format =
+                    time::format_description::parse("[month repr:short] [day], [year]").ok();
+                format
+                    .and_then(|f| local_datetime.format(&f).ok())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+
+        let remote = repository.update(cx, |repo, cx| {
+            let remote_url = repo.default_remote_url()?;
+            let provider_registry = GitHostingProviderRegistry::default_global(cx);
+            let (provider, parsed) = parse_git_remote_url(provider_registry, &remote_url)?;
+            Some(GitRemote {
+                host: provider,
+                owner: parsed.owner.into(),
+                repo: parsed.repo.into(),
+            })
+        });
+
+        let avatar = {
+            let author_email_for_avatar = if author_email.is_empty() {
+                None
+            } else {
+                Some(author_email.clone())
+            };
+
+            CommitAvatar::new(&full_sha, author_email_for_avatar, remote.as_ref())
+                .size(px(32.))
+                .render(window, cx)
+        };
+
+        let changed_files_count = self.selected_commit_files.len();
+
+        let (total_lines_added, total_lines_removed) =
+            self.selected_commit_diff_stats.unwrap_or((0, 0));
+
+        let mut changed_file_entries = self.selected_commit_files.clone();
+        if !self.changed_files_view_mode.is_tree() {
+            changed_file_entries.sort_by_key(|file| match file.status {
+                FileStatus::Tracked(TrackedStatus {
+                    index_status: StatusCode::Added,
+                    ..
+                }) => 0,
+                FileStatus::Tracked(TrackedStatus {
+                    index_status: StatusCode::Deleted,
+                    ..
+                }) => 2,
+                _ => 1,
+            });
+        }
+        let changed_file_entries = Rc::new(changed_file_entries);
+        let tree_entries: Rc<Vec<ChangedFileTreeEntry>> = if self.changed_files_view_mode.is_tree()
+        {
+            Rc::new(build_changed_file_tree_entries(
+                changed_file_entries.as_ref().clone(),
+                &self.changed_files_expanded_dirs,
+            ))
+        } else {
+            Rc::default()
+        };
+
+        if self.pending_reveal_changed_file.replace(false) {
+            let selected_index = self.selected_changed_file.as_ref().and_then(|path| {
+                if self.changed_files_view_mode.is_tree() {
+                    tree_entries.iter().position(|entry| {
+                        matches!(entry, ChangedFileTreeEntry::File(file) if &file.entry.repo_path == path)
+                    })
+                } else {
+                    changed_file_entries.iter().position(|file| &file.repo_path == path)
+                }
+            });
+            if let Some(index) = selected_index {
+                let sticky_rows = tree_entries
+                    .get(index)
+                    .map_or(0, ChangedFileTreeEntry::depth);
+                self.changed_files_scroll_handle.scroll_to_item_with_offset(
+                    index,
+                    ScrollStrategy::Nearest,
+                    sticky_rows,
+                );
+            }
+        }
+
+        let is_tree_view = self.changed_files_view_mode.is_tree();
+        let view_toggle = IconButton::new("toggle-changed-files-view", IconName::ListTree)
+            .icon_size(IconSize::Small)
+            .toggle_state(self.changed_files_view_mode.is_tree())
+            .tooltip({
+                let tooltip = if is_tree_view {
+                    "Show Flat View"
+                } else {
+                    "Show Tree View"
+                };
+                move |_, cx| Tooltip::for_action(tooltip, &ToggleChangedFilesView, cx)
+            })
+            .on_click(cx.listener(|this, _, _window, cx| {
+                this.changed_files_view_mode = this.changed_files_view_mode.toggled();
+                this.changed_files_scroll_handle
+                    .scroll_to_item(0, ScrollStrategy::Top);
+                cx.notify();
+            }));
+
+        v_flex()
+            .min_w(px(240.))
+            .min_h_0()
+            .h_full()
+            .bg(cx.theme().colors().editor_background)
+            .flex_basis(DefiniteLength::Fraction(
+                self.detail_content_split_state
+                    .read(cx)
+                    .visible_left_ratio(),
+            ))
+            .child(
+                v_flex()
+                    .relative()
+                    .w_full()
+                    .p_2()
+                    .gap_2()
+                    .children(self.active_comparison.map(|(base, target)| {
+                        v_flex().pr_6()
+                            .child(Label::new("Comparing snapshots").color(Color::Accent))
+                            .child(Label::new(format!("{} → {}", base.display_short(), target.display_short())))
+                            .child(Label::new("Target commit").size(LabelSize::Small).color(Color::Muted))
+                    }))
+                    .child(
+                        div().absolute().top_2().right_2().child(
+                            IconButton::new("close-detail", IconName::Close)
+                                .icon_size(IconSize::Small)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.clear_diff(cx);
+                                    this.comparison = None;
+                                    this.active_comparison = None;
+                                    this.selected_entry_idx = None;
+                                    this.selected_commit_files.clear();
+                                    this.selected_commit_diff_stats = None;
+                                    this.selected_commit_diff_error = None;
+                                    this.selected_commit_diff = None;
+                                    this.selected_commit_view = None;
+                                    this.pending_commit_view = None;
+                                    this.selected_changed_file = None;
+                                    this.selected_commit_message = None;
+                                    this._selected_commit_message_task = None;
+                                    this.changed_files_expanded_dirs.clear();
+                                    this._commit_diff_task = None;
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .child(
+                        h_flex().py_1().pr_6().w_full().gap_2().child(avatar).child(
+                            v_flex().min_w_0().child(Label::new(author_name)).child(
+                                Label::new(date_string)
+                                    .color(Color::Muted)
+                                    .size(LabelSize::Small),
+                            ),
+                        ),
+                    )
+                    .children((!ref_names.is_empty()).then(|| {
+                        h_flex()
+                            .gap_1()
+                            .flex_wrap()
+                            .children(ref_names.iter().map(|name| {
+                                let is_head = Self::is_head_ref(name.as_ref(), &head_branch_name);
+                                self.render_ref_chip(name, accent_color, is_head, selected_idx, cx)
+                            }))
+                    }))
+                    .child(
+                        h_flex()
+                            .flex_wrap()
+                            .gap_1()
+                            .when(!author_email.is_empty(), |this| {
+                                let copied_state: Entity<CopiedState> = window.use_keyed_state(
+                                    "author-email-copy",
+                                    cx,
+                                    CopiedState::new,
+                                );
+                                let is_copied = copied_state.read(cx).is_copied();
+
+                                let (icon, icon_color, tooltip_label) = if is_copied {
+                                    (IconName::Check, Color::Success, "Email Copied!")
+                                } else {
+                                    (IconName::Envelope, Color::Muted, "Copy Email")
+                                };
+
+                                let copy_email = author_email.clone();
+                                let author_email_for_tooltip = author_email.clone();
+
+                                this.child(
+                                    Button::new("author-email-copy", author_email.clone())
+                                        .start_icon(
+                                            Icon::new(icon).size(IconSize::Small).color(icon_color),
+                                        )
+                                        .label_size(LabelSize::Small)
+                                        .truncate(true)
+                                        .color(Color::Muted)
+                                        .tooltip(move |_, cx| {
+                                            Tooltip::with_meta(
+                                                tooltip_label,
+                                                None,
+                                                author_email_for_tooltip.clone(),
+                                                cx,
+                                            )
+                                        })
+                                        .on_click(move |_, _, cx| {
+                                            copied_state.update(cx, |state, _cx| {
+                                                state.mark_copied();
+                                            });
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                copy_email.to_string(),
+                                            ));
+                                            let state_id = copied_state.entity_id();
+                                            cx.spawn(async move |cx| {
+                                                cx.background_executor()
+                                                    .timer(COPIED_STATE_DURATION)
+                                                    .await;
+                                                cx.update(|cx| {
+                                                    cx.notify(state_id);
+                                                })
+                                            })
+                                            .detach();
+                                        }),
+                                )
+                            })
+                            .child({
+                                let copy_sha = full_sha.clone();
+                                let copied_state: Entity<CopiedState> =
+                                    window.use_keyed_state("sha-copy", cx, CopiedState::new);
+                                let is_copied = copied_state.read(cx).is_copied();
+
+                                let (icon, icon_color, tooltip_label) = if is_copied {
+                                    (IconName::Check, Color::Success, "Commit SHA Copied!")
+                                } else {
+                                    (IconName::Hash, Color::Muted, "Copy Commit SHA")
+                                };
+
+                                Button::new("sha-button", &full_sha)
+                                    .start_icon(
+                                        Icon::new(icon).size(IconSize::Small).color(icon_color),
+                                    )
+                                    .label_size(LabelSize::Small)
+                                    .truncate(true)
+                                    .color(Color::Muted)
+                                    .tooltip({
+                                        let full_sha = full_sha.clone();
+                                        move |_, cx| {
+                                            Tooltip::with_meta(
+                                                tooltip_label,
+                                                None,
+                                                full_sha.clone(),
+                                                cx,
+                                            )
+                                        }
+                                    })
+                                    .on_click(move |_, _, cx| {
+                                        copied_state.update(cx, |state, _cx| {
+                                            state.mark_copied();
+                                        });
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            copy_sha.to_string(),
+                                        ));
+                                        let state_id = copied_state.entity_id();
+                                        cx.spawn(async move |cx| {
+                                            cx.background_executor()
+                                                .timer(COPIED_STATE_DURATION)
+                                                .await;
+                                            cx.update(|cx| {
+                                                cx.notify(state_id);
+                                            })
+                                        })
+                                        .detach();
+                                    })
+                            })
+                            .when_some(remote.clone(), |this, remote| {
+                                let provider_name = remote.host.name();
+                                let icon = ui::git_hosting_provider_icon(provider_name.as_str());
+                                let parsed_remote = ParsedGitRemote {
+                                    owner: remote.owner.as_ref().into(),
+                                    repo: remote.repo.as_ref().into(),
+                                };
+                                let params = BuildCommitPermalinkParams {
+                                    sha: full_sha.as_ref(),
+                                };
+                                let url = remote
+                                    .host
+                                    .build_commit_permalink(&parsed_remote, params)
+                                    .to_string();
+
+                                this.child(
+                                    Button::new(
+                                        "view-on-provider",
+                                        format!("View on {}", provider_name),
+                                    )
+                                    .start_icon(
+                                        Icon::new(icon).size(IconSize::Small).color(Color::Muted),
+                                    )
+                                    .label_size(LabelSize::Small)
+                                    .truncate(true)
+                                    .color(Color::Muted)
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            cx.open_url(&url);
+                                        },
+                                    ),
+                                )
+                            }),
+                    ),
+            )
+            .child(Divider::horizontal())
+            .child(self.render_commit_message(window, cx))
+            .child(Divider::horizontal())
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(
+                        h_flex()
+                            .p_2()
+                            .pr_3()
+                            .pb_1()
+                            .gap_1()
+                            .w_full()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Label::new(format!(
+                                            "{} Changed {}",
+                                            changed_files_count,
+                                            if changed_files_count == 1 {
+                                                "File"
+                                            } else {
+                                                "Files"
+                                            }
+                                        ))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                    )
+                                    .child(Divider::vertical())
+                                    .child(view_toggle),
+                            )
+                            .child(DiffStat::new(
+                                "commit-diff-stat",
+                                total_lines_added,
+                                total_lines_removed,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("changed-files-container")
+                            .flex_1()
+                            .min_h_0()
+                            .child({
+                                let flat_entries = changed_file_entries;
+
+                                let entry_count = if is_tree_view {
+                                    tree_entries.len()
+                                } else {
+                                    flat_entries.len()
+                                };
+                                let commit_sha = full_sha.clone();
+                                let repository = repository.downgrade();
+                                let workspace = self.workspace.clone();
+                                let git_graph = cx.weak_entity();
+                                let selected_changed_file = self.selected_changed_file.clone();
+                                let indent_tree_entries = tree_entries.clone();
+                                let sticky_tree_entries = tree_entries.clone();
+
+                                uniform_list(
+                                    "changed-files-list",
+                                    entry_count,
+                                    move |range, _window, cx| {
+                                        range
+                                            .map(|ix| {
+                                                if is_tree_view {
+                                                    match &tree_entries[ix] {
+                                                        ChangedFileTreeEntry::Directory(entry) => {
+                                                            entry.render(ix, git_graph.clone(), cx)
+                                                        }
+                                                        ChangedFileTreeEntry::File(entry) => {
+                                                            entry.entry.render(
+                                                                ix,
+                                                                entry.depth,
+                                                                None,
+                                                                commit_sha.clone(),
+                                                                repository.clone(),
+                                                                workspace.clone(),
+                                                                git_graph.clone(),
+                                                                selected_changed_file.as_ref()
+                                                                    == Some(&entry.entry.repo_path),
+                                                                cx,
+                                                            )
+                                                        }
+                                                    }
+                                                } else {
+                                                    let directory_label = (!flat_entries[ix]
+                                                        .dir_path
+                                                        .is_empty())
+                                                    .then(|| flat_entries[ix].dir_path.clone());
+                                                    flat_entries[ix].render(
+                                                        ix,
+                                                        0,
+                                                        directory_label,
+                                                        commit_sha.clone(),
+                                                        repository.clone(),
+                                                        workspace.clone(),
+                                                        git_graph.clone(),
+                                                        selected_changed_file.as_ref()
+                                                            == Some(&flat_entries[ix].repo_path),
+                                                        cx,
+                                                    )
+                                                }
+                                            })
+                                            .collect()
+                                    },
+                                )
+                                .when(is_tree_view, |list| {
+                                    list.with_decoration(
+                                        ui::indent_guides(
+                                            px(TREE_INDENT),
+                                            IndentGuideColors::panel(cx),
+                                        )
+                                        .with_left_offset(
+                                            ui::LIST_ITEM_INDENT_GUIDE_LEFT_OFFSET - px(2.),
+                                        )
+                                        .with_compute_indents_fn(
+                                            cx.entity(),
+                                            move |_, range, _window, _cx| {
+                                                range
+                                                    .map(|ix| match indent_tree_entries.get(ix) {
+                                                        Some(ChangedFileTreeEntry::Directory(
+                                                            entry,
+                                                        )) => entry.depth,
+                                                        Some(ChangedFileTreeEntry::File(entry)) => {
+                                                            entry.depth
+                                                        }
+                                                        None => 0,
+                                                    })
+                                                    .collect()
+                                            },
+                                        ),
+                                    )
+                                })
+                                .when(is_tree_view, |list| {
+                                    let candidates = sticky_tree_entries.clone();
+                                    let parents = changed_file_parent_indices(&sticky_tree_entries);
+                                    list.with_decoration(
+                                        ui::sticky_items(
+                                            cx.entity(),
+                                            move |_, range, _, _| {
+                                                range
+                                                    .filter_map(|index| {
+                                                        candidates.get(index).map(|entry| {
+                                                            ChangedFileStickyCandidate {
+                                                                index,
+                                                                depth: entry.depth(),
+                                                            }
+                                                        })
+                                                    })
+                                                    .collect()
+                                            },
+                                            move |_, candidate, _, cx| {
+                                                changed_file_ancestor_indices(
+                                                    &parents,
+                                                    candidate.index,
+                                                )
+                                                .into_iter()
+                                                .enumerate()
+                                                .filter_map(|(sticky_index, index)| {
+                                                    match sticky_tree_entries.get(index)? {
+                                                        ChangedFileTreeEntry::Directory(entry) => {
+                                                            Some(entry.render_with_sticky_index(
+                                                                index,
+                                                                Some(sticky_index),
+                                                                cx.weak_entity(),
+                                                                cx,
+                                                            ))
+                                                        }
+                                                        ChangedFileTreeEntry::File(_) => None,
+                                                    }
+                                                })
+                                                .collect()
+                                            },
+                                        )
+                                        .with_decoration(
+                                            ui::indent_guides(
+                                                px(TREE_INDENT),
+                                                IndentGuideColors::panel(cx),
+                                            )
+                                            .with_left_offset(
+                                                ui::LIST_ITEM_INDENT_GUIDE_LEFT_OFFSET - px(2.),
+                                            ),
+                                        ),
+                                    )
+                                })
+                                .size_full()
+                                .track_scroll(&self.changed_files_scroll_handle)
+                            })
+                            .vertical_scrollbar_for(&self.changed_files_scroll_handle, window, cx),
+                    ),
+            )
+            .child(Divider::horizontal())
+            .child(
+                h_flex().p_1p5().w_full().child(
+                    Button::new("view-commit", "View Commit")
+                        .disabled(self.active_comparison.is_some())
+                        .full_width()
+                        .start_icon(
+                            Icon::new(IconName::GitCommit)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .style(ButtonStyle::OutlinedGhost)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_selected_commit_view(window, cx);
+                        })),
+                ),
+            )
+            .into_any_element()
+    }
+
+    fn render_graph_canvas(
+        &self,
+        window: &Window,
+        cx: &mut Context<GitGraphNext>,
+    ) -> impl IntoElement {
+        let row_height = Self::row_height(window, cx);
+        let visible_row_count = self.visible_row_count(window, cx);
+        let table_state = self.table_interaction_state.read(cx);
+        let viewport_height = table_state
+            .scroll_handle
+            .0
+            .borrow()
+            .last_item_size
+            .map(|size| size.item.height)
+            .unwrap_or(window.viewport_size().height);
+        let loaded_commit_count = self.graph_data.commits.len();
+
+        let content_height = row_height * loaded_commit_count;
+        let max_scroll = (content_height - viewport_height).max(px(0.));
+        let scroll_offset_y = (-table_state.scroll_offset().y).clamp(px(0.), max_scroll);
+
+        let first_visible_row = (scroll_offset_y / row_height).floor() as usize;
+        let vertical_scroll_offset = scroll_offset_y - (first_visible_row as f32 * row_height);
+
+        let graph_viewport_width = self.graph_viewport_width(window, cx);
+        let graph_width = if self.graph_canvas_content_width() > graph_viewport_width {
+            self.graph_canvas_content_width()
+        } else {
+            graph_viewport_width
+        };
+        let last_visible_row = first_visible_row + visible_row_count + 1;
+
+        let viewport_range = first_visible_row.min(loaded_commit_count.saturating_sub(1))
+            ..(last_visible_row).min(loaded_commit_count);
+        let rows = self.graph_data.commits[viewport_range.clone()].to_vec();
+        let commit_lines: Vec<_> = self
+            .graph_data
+            .lines
+            .iter()
+            .filter(|line| {
+                line.full_interval.start <= viewport_range.end
+                    && line.full_interval.end >= viewport_range.start
+            })
+            .cloned()
+            .collect();
+
+        let mut lines: BTreeMap<usize, Vec<_>> = BTreeMap::new();
+
+        let hovered_entry_idx = self.hovered_entry_idx;
+        let selected_entry_idx = self
+            .selected_entry_idx
+            .filter(|_| self.comparison.is_none());
+        let comparison_indices = self.comparison_indices();
+        let context_menu_target_index = self
+            .context_menu
+            .as_ref()
+            .and_then(|menu| menu.target_entry_index);
+        let is_focused = self.focus_handle.is_focused(window);
+        let graph_canvas_bounds = self.graph_canvas_bounds.clone();
+
+        gpui::canvas(
+            move |_bounds, _window, _cx| {},
+            move |bounds: Bounds<Pixels>, _: (), window: &mut Window, cx: &mut App| {
+                graph_canvas_bounds.set(Some(bounds));
+
+                window.paint_layer(bounds, |window| {
+                    let accent_colors = cx.theme().accents();
+
+                    let hover_bg = cx.theme().colors().element_hover.opacity(0.6);
+                    let selected_bg = if is_focused {
+                        cx.theme().colors().element_selected
+                    } else {
+                        cx.theme().colors().element_hover
+                    };
+
+                    for visible_row_idx in 0..rows.len() {
+                        let absolute_row_idx = first_visible_row + visible_row_idx;
+                        let is_hovered = hovered_entry_idx == Some(absolute_row_idx);
+                        let is_selected = selected_entry_idx == Some(absolute_row_idx)
+                            || comparison_indices.contains(&Some(absolute_row_idx));
+                        let is_context_menu_target =
+                            context_menu_target_index == Some(absolute_row_idx);
+
+                        if is_hovered || is_selected || is_context_menu_target {
+                            let row_y = bounds.origin.y + visible_row_idx as f32 * row_height
+                                - vertical_scroll_offset;
+
+                            let row_bounds = Bounds::new(
+                                point(bounds.origin.x, row_y),
+                                gpui::Size {
+                                    width: bounds.size.width,
+                                    height: row_height,
+                                },
+                            );
+
+                            let bg_color = if is_selected || is_context_menu_target {
+                                selected_bg
+                            } else {
+                                hover_bg
+                            };
+                            window.paint_quad(gpui::fill(row_bounds, bg_color));
+                        }
+                    }
+
+                    for (row_idx, row) in rows.into_iter().enumerate() {
+                        let row_color = accent_colors.color_for_index(row.color_idx as u32);
+                        let row_y_center =
+                            bounds.origin.y + row_idx as f32 * row_height + row_height / 2.0
+                                - vertical_scroll_offset;
+
+                        let commit_x = lane_center_x(bounds, row.lane as f32);
+
+                        draw_commit_circle(commit_x, row_y_center, row_color, window);
+                    }
+
+                    for line in commit_lines {
+                        let Some((start_segment_idx, start_column)) =
+                            line.get_first_visible_segment_idx(first_visible_row)
+                        else {
+                            continue;
+                        };
+
+                        let line_x = lane_center_x(bounds, start_column as f32);
+
+                        let start_row = line.full_interval.start as i32 - first_visible_row as i32;
+
+                        let from_y =
+                            bounds.origin.y + start_row as f32 * row_height + row_height / 2.0
+                                - vertical_scroll_offset
+                                + COMMIT_CIRCLE_RADIUS;
+
+                        let mut current_row = from_y;
+                        let mut current_column = line_x;
+
+                        let mut builder = PathBuilder::stroke(LINE_WIDTH);
+                        builder.move_to(point(line_x, from_y));
+
+                        let segments = &line.segments[start_segment_idx..];
+                        let desired_curve_height = row_height / 3.0;
+                        let desired_curve_width = LANE_WIDTH / 3.0;
+
+                        for (segment_idx, segment) in segments.iter().enumerate() {
+                            let is_last = segment_idx + 1 == segments.len();
+
+                            match segment {
+                                CommitLineSegment::Straight { to_row } => {
+                                    let mut dest_row = to_row_center(
+                                        to_row - first_visible_row,
+                                        row_height,
+                                        vertical_scroll_offset,
+                                        bounds,
+                                    );
+                                    if is_last {
+                                        dest_row -= COMMIT_CIRCLE_RADIUS;
+                                    }
+
+                                    let dest_point = point(current_column, dest_row);
+
+                                    current_row = dest_point.y;
+                                    builder.line_to(dest_point);
+                                    builder.move_to(dest_point);
+                                }
+                                CommitLineSegment::Curve {
+                                    to_column,
+                                    on_row,
+                                    curve_kind,
+                                } => {
+                                    let mut to_column = lane_center_x(bounds, *to_column as f32);
+
+                                    let mut to_row = to_row_center(
+                                        *on_row - first_visible_row,
+                                        row_height,
+                                        vertical_scroll_offset,
+                                        bounds,
+                                    );
+
+                                    // This means that this branch was a checkout
+                                    let going_right = to_column > current_column;
+                                    let column_shift = if going_right {
+                                        COMMIT_CIRCLE_RADIUS + COMMIT_CIRCLE_STROKE_WIDTH
+                                    } else {
+                                        -COMMIT_CIRCLE_RADIUS - COMMIT_CIRCLE_STROKE_WIDTH
+                                    };
+
+                                    match curve_kind {
+                                        CurveKind::Checkout => {
+                                            if is_last {
+                                                to_column -= column_shift;
+                                            }
+
+                                            let available_curve_width =
+                                                (to_column - current_column).abs();
+                                            let available_curve_height =
+                                                (to_row - current_row).abs();
+                                            let curve_width =
+                                                desired_curve_width.min(available_curve_width);
+                                            let curve_height =
+                                                desired_curve_height.min(available_curve_height);
+                                            let signed_curve_width = if going_right {
+                                                curve_width
+                                            } else {
+                                                -curve_width
+                                            };
+                                            let curve_start =
+                                                point(current_column, to_row - curve_height);
+                                            let curve_end =
+                                                point(current_column + signed_curve_width, to_row);
+                                            let curve_control = point(current_column, to_row);
+
+                                            builder.move_to(point(current_column, current_row));
+                                            builder.line_to(curve_start);
+                                            builder.move_to(curve_start);
+                                            builder.curve_to(curve_end, curve_control);
+                                            builder.move_to(curve_end);
+                                            builder.line_to(point(to_column, to_row));
+                                        }
+                                        CurveKind::Merge => {
+                                            if is_last {
+                                                to_row -= COMMIT_CIRCLE_RADIUS;
+                                            }
+
+                                            let merge_start = point(
+                                                current_column + column_shift,
+                                                current_row - COMMIT_CIRCLE_RADIUS,
+                                            );
+                                            let available_curve_width =
+                                                (to_column - merge_start.x).abs();
+                                            let available_curve_height =
+                                                (to_row - merge_start.y).abs();
+                                            let curve_width =
+                                                desired_curve_width.min(available_curve_width);
+                                            let curve_height =
+                                                desired_curve_height.min(available_curve_height);
+                                            let signed_curve_width = if going_right {
+                                                curve_width
+                                            } else {
+                                                -curve_width
+                                            };
+                                            let curve_start = point(
+                                                to_column - signed_curve_width,
+                                                merge_start.y,
+                                            );
+                                            let curve_end =
+                                                point(to_column, merge_start.y + curve_height);
+                                            let curve_control = point(to_column, merge_start.y);
+
+                                            builder.move_to(merge_start);
+                                            builder.line_to(curve_start);
+                                            builder.move_to(curve_start);
+                                            builder.curve_to(curve_end, curve_control);
+                                            builder.move_to(curve_end);
+                                            builder.line_to(point(to_column, to_row));
+                                        }
+                                    }
+                                    current_row = to_row;
+                                    current_column = to_column;
+                                    builder.move_to(point(current_column, current_row));
+                                }
+                            }
+                        }
+
+                        builder.close();
+                        lines.entry(line.color_idx).or_default().push(builder);
+                    }
+
+                    for (color_idx, builders) in lines {
+                        let line_color = accent_colors.color_for_index(color_idx as u32);
+
+                        for builder in builders {
+                            if let Ok(path) = builder.build() {
+                                // we paint each color on it's own layer to stop overlapping lines
+                                // of different colors changing the color of a line
+                                window.paint_layer(bounds, |window| {
+                                    window.paint_path(path, line_color);
+                                });
+                            }
+                        }
+                    }
+                })
+            },
+        )
+        .w(graph_width)
+        .h_full()
+    }
+
+    fn row_at_position(
+        &self,
+        position_y: Pixels,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<usize> {
+        let canvas_bounds = self.graph_canvas_bounds.get()?;
+        let table_state = self.table_interaction_state.read(cx);
+        let scroll_offset_y = -table_state.scroll_offset().y;
+
+        let local_y = position_y - canvas_bounds.origin.y;
+
+        if local_y >= px(0.) && local_y < canvas_bounds.size.height {
+            let absolute_y = local_y + scroll_offset_y;
+            let row_height = Self::row_height(window, cx);
+            let absolute_row = (absolute_y / row_height).floor() as usize;
+
+            if absolute_row < self.graph_data.commits.len() {
+                return Some(absolute_row);
+            }
+        }
+
+        None
+    }
+
+    fn handle_graph_mouse_move(
+        &mut self,
+        event: &gpui::MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(row) = self.row_at_position(event.position.y, window, cx) {
+            if self.hovered_entry_idx != Some(row) {
+                self.hovered_entry_idx = Some(row);
+                cx.notify();
+            }
+        } else if self.hovered_entry_idx.is_some() {
+            self.hovered_entry_idx = None;
+            cx.notify();
+        }
+    }
+
+    fn comparison_indices(&self) -> [Option<usize>; 2] {
+        self.comparison.map_or([None, None], |(base, target)| {
+            [base, target].map(|sha| {
+                self.graph_data
+                    .commits
+                    .iter()
+                    .position(|commit| commit.data.sha == sha)
+            })
+        })
+    }
+
+    fn handle_entry_click(
+        &mut self,
+        entry_idx: usize,
+        event: &ClickEvent,
+        scroll_strategy: ScrollStrategy,
+        focus_handle: Option<&FocusHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Right-clicks open the context menu, not the details panel.
+        if event.is_right_click() {
+            return;
+        }
+
+        focus_handle.unwrap_or(&self.focus_handle).focus(window, cx);
+
+        let modifiers = event.modifiers();
+        if modifiers.control || modifiers.platform || modifiers.shift {
+            if let Some(target) = self
+                .graph_data
+                .commits
+                .get(entry_idx)
+                .map(|commit| commit.data.sha)
+                && let Some(base) = self.comparison.map(|(base, _)| base).or_else(|| {
+                    self.selected_entry_idx
+                        .and_then(|index| self.graph_data.commits.get(index))
+                        .map(|commit| commit.data.sha)
+                })
+            {
+                self.comparison = (base != target).then_some((base, target));
+                self.context_menu = None;
+                cx.notify();
+                return;
+            }
+        }
+        self.select_entry(entry_idx, scroll_strategy, cx);
+
+        if event.click_count() >= 2 {
+            self.open_commit_view(entry_idx, window, cx);
+        }
+    }
+
+    fn handle_graph_click(
+        &mut self,
+        event: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(row) = self.row_at_position(event.position().y, window, cx) {
+            self.handle_entry_click(row, event, ScrollStrategy::Nearest, None, window, cx);
+        }
+    }
+
+    fn handle_entry_secondary_mouse_down(
+        &mut self,
+        entry_idx: usize,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.deploy_entry_context_menu(event.position, entry_idx, None, window, cx);
+        cx.stop_propagation();
+    }
+
+    fn handle_graph_secondary_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(row) = self.row_at_position(event.position.y, window, cx) else {
+            return;
+        };
+
+        self.handle_entry_secondary_mouse_down(row, event, window, cx);
+    }
+
+    fn handle_graph_scroll(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let line_height = window.line_height();
+        let delta = event.delta.pixel_delta(line_height);
+
+        let table_state = self.table_interaction_state.read(cx);
+        let current_offset = table_state.scroll_offset();
+
+        let viewport_height = table_state.scroll_handle.viewport().size.height;
+
+        let commit_count = match self.graph_data.max_commit_count {
+            AllCommitCount::Loading(count) => count,
+            AllCommitCount::FullyLoaded(count) => count,
+            AllCommitCount::NotLoaded => self.graph_data.commits.len(),
+        };
+        let content_height = Self::row_height(window, cx) * commit_count;
+        let max_vertical_scroll = (viewport_height - content_height).min(px(0.));
+
+        let new_y = (current_offset.y + delta.y).clamp(max_vertical_scroll, px(0.));
+        let new_offset = Point::new(current_offset.x, new_y);
+
+        if new_offset != current_offset {
+            table_state.set_scroll_offset(new_offset);
+            cx.notify();
+        }
+    }
+
+    fn commit_count_and_loading_state(&mut self, cx: &mut Context<Self>) -> (usize, bool) {
+        match self.graph_data.max_commit_count {
+            AllCommitCount::FullyLoaded(count) => (count, false),
+            AllCommitCount::Loading(count) => {
+                let is_loading = self
+                    .get_repository(cx)
+                    .map(|repository| {
+                        repository.update(cx, |repository, cx| {
+                            repository
+                                .graph_data(self.log_source.clone(), self.log_order, 0..0, cx)
+                                .is_loading
+                        })
+                    })
+                    .unwrap_or(false);
+
+                (count, is_loading)
+            }
+            AllCommitCount::NotLoaded => {
+                let (commit_count, is_loading) = if let Some(repository) = self.get_repository(cx) {
+                    repository.update(cx, |repository, cx| {
+                        // Start loading the graph data if we haven't started already
+                        let GraphDataResponse {
+                            commits,
+                            is_loading,
+                            error: _,
+                        } = repository.graph_data(
+                            self.log_source.clone(),
+                            self.log_order,
+                            0..usize::MAX,
+                            cx,
+                        );
+                        self.graph_data.add_commits(commits);
+                        (commits.len(), is_loading)
+                    })
+                } else {
+                    (0, false)
+                };
+
+                (commit_count, is_loading)
+            }
+        }
+    }
+
+    fn render_graph_detail_resize_handle(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("git-graph-detail-resize-container")
+            .relative()
+            .w_full()
+            .flex_shrink_0()
+            .h(px(1.))
+            .bg(cx.theme().colors().border_variant)
+            .child(
+                div()
+                    .id("git-graph-detail-resize-handle")
+                    .absolute()
+                    .top(px(-RESIZE_HANDLE_WIDTH / 2.0))
+                    .w_full()
+                    .h(px(RESIZE_HANDLE_WIDTH))
+                    .cursor_row_resize()
+                    .block_mouse_except_scroll()
+                    .on_click(cx.listener(|this, event: &ClickEvent, _window, cx| {
+                        if event.click_count() >= 2 {
+                            this.graph_detail_split_state.update(cx, |state, _| {
+                                state.on_double_click();
+                            });
+                            cx.emit(ItemEvent::Edit);
+                            cx.notify();
+                        }
+                        cx.stop_propagation();
+                    }))
+                    .on_drag(DraggedGraphDetailSplitHandle, |_, _, _, cx| {
+                        cx.new(|_| gpui::Empty)
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_detail_content_resize_handle(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("git-graph-detail-content-resize-container")
+            .relative()
+            .h_full()
+            .flex_shrink_0()
+            .w(px(1.))
+            .bg(cx.theme().colors().border_variant)
+            .child(
+                div()
+                    .id("git-graph-detail-content-resize-handle")
+                    .absolute()
+                    .left(px(-RESIZE_HANDLE_WIDTH / 2.0))
+                    .w(px(RESIZE_HANDLE_WIDTH))
+                    .h_full()
+                    .cursor_col_resize()
+                    .block_mouse_except_scroll()
+                    .on_click(cx.listener(|this, event: &ClickEvent, _window, cx| {
+                        if event.click_count() >= 2 {
+                            this.detail_content_split_state.update(cx, |state, _| {
+                                state.on_double_click();
+                            });
+                            cx.emit(ItemEvent::Edit);
+                            cx.notify();
+                        }
+                        cx.stop_propagation();
+                    }))
+                    .on_drag(DraggedDetailContentSplitHandle, |_, _, _, cx| {
+                        cx.new(|_| gpui::Empty)
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_commit_diff_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let error = self.selected_commit_diff_error.clone().or_else(|| {
+            self.selected_commit_view
+                .as_ref()
+                .and_then(|diff_view| diff_view.read(cx).load_error())
+        });
+        let editor = self
+            .selected_commit_view
+            .as_ref()
+            .filter(|_| error.is_none())
+            .map(|diff_view| diff_view.read(cx).editor());
+        let has_no_changes = self.selected_commit_diff.is_some()
+            && self.selected_commit_files.is_empty()
+            && error.is_none();
+        let selected_file = self.selected_changed_file.as_ref().and_then(|path| {
+            self.selected_commit_files
+                .iter()
+                .find(|entry| &entry.repo_path == path)
+                .cloned()
+        });
+        let search_bar = self
+            .embedded_search_bar
+            .as_ref()
+            .and_then(|(bar, _)| bar.upgrade());
+        let is_searching = editor.is_some()
+            && search_bar
+                .as_ref()
+                .is_some_and(|bar| !bar.read(cx).is_dismissed());
+        let selected_file_diff_stats = selected_file.as_ref().and_then(|file| file.diff_stats);
+        let selected_file_heading = if let Some(file) = selected_file {
+            let path: SharedString = file.repo_path.as_unix_str().to_string().into();
+            let tooltip_path = path.clone();
+            h_flex()
+                .id("git-graph-selected-file-heading")
+                .min_w_0()
+                .flex_1()
+                .gap_1()
+                .child(git_status_icon(file.status))
+                .child(Label::new(path).size(LabelSize::Small).truncate())
+                .tooltip(move |_, cx| {
+                    Tooltip::with_meta("Current File", None, tooltip_path.clone(), cx)
+                })
+                .into_any_element()
+        } else {
+            Label::new("Changes")
+                .size(LabelSize::Small)
+                .into_any_element()
+        };
+        let (excerpt_icon, excerpt_tooltip) = if self.showing_all_diff_lines {
+            (IconName::ChevronDownUp, "Show Changes Only")
+        } else {
+            (IconName::ChevronUpDown, "Show All Lines")
+        };
+
+        v_flex()
+            .min_w_0()
+            .min_h_0()
+            .h_full()
+            .flex_basis(DefiniteLength::Fraction(
+                self.detail_content_split_state.read(cx).right_ratio(),
+            ))
+            .child(
+                h_flex()
+                    .id("git-graph-diff-header")
+                    .overflow_x_scroll()
+                    .h(px(34.))
+                    .debug_selector(|| "git-graph-diff-header".into())
+                    .px_2()
+                    .flex_shrink_0()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        div()
+                            .min_w_48()
+                            .flex_1()
+                            .debug_selector(|| "git-graph-diff-path".into())
+                            .child(selected_file_heading),
+                    )
+                    .children(search_bar.filter(|_| is_searching).map(|bar| {
+                        div()
+                            .id("git-graph-inline-search")
+                            .w(px(480.))
+                            .flex_none()
+                            .mx_2()
+                            .child(bar)
+                    }))
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .justify_end()
+                            .debug_selector(|| "git-graph-diff-actions".into())
+                            .gap_1()
+                            .child(
+                                IconButton::new("git-graph-find-in-diff", IconName::MagnifyingGlass)
+                                    .icon_size(IconSize::Small)
+                                    .disabled(editor.is_none() || self.embedded_search_bar.is_none())
+                                    .tooltip(Tooltip::text("Search in File"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        if let Some(view) = &this.selected_commit_view {
+                                            view.read(cx).editor().focus_handle(cx).focus(window, cx);
+                                            window.dispatch_action(
+                                                Box::new(buffer_search::Deploy::find()),
+                                                cx,
+                                            );
+                                        }
+                                    })),
+                            )
+                            .children(selected_file_diff_stats.map(|(added, removed)| {
+                                DiffStat::new("git-graph-selected-file-diff-stat", added, removed)
+                            }))
+                            .child(
+                                IconButton::new("git-graph-toggle-diff-excerpts", excerpt_icon)
+                                    .icon_size(IconSize::Small)
+                                    .disabled(editor.is_none())
+                                    .tooltip(Tooltip::text(excerpt_tooltip))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_showing_all_diff_lines(cx);
+                                    })),
+                            )
+                            .child(
+                                IconButton::new("git-graph-previous-diff-hunk", IconName::ArrowUp)
+                                    .icon_size(IconSize::Small)
+                                    .disabled(editor.is_none())
+                                    .tooltip(Tooltip::text("Go to Previous Hunk"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        if let Some(commit_view) =
+                                            this.selected_commit_view.as_ref()
+                                        {
+                                            commit_view.update(cx, |commit_view, cx| {
+                                                commit_view.go_to_previous_hunk(window, cx);
+                                            });
+                                        }
+                                    })),
+                            )
+                            .child(
+                                IconButton::new("git-graph-next-diff-hunk", IconName::ArrowDown)
+                                    .icon_size(IconSize::Small)
+                                    .disabled(editor.is_none())
+                                    .tooltip(Tooltip::text("Go to Next Hunk"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        if let Some(commit_view) =
+                                            this.selected_commit_view.as_ref()
+                                        {
+                                            commit_view.update(cx, |commit_view, cx| {
+                                                commit_view.go_to_next_hunk(window, cx);
+                                            });
+                                        }
+                                    })),
+                            )
+                            .child(
+                                IconButton::new(
+                                    "git-graph-toggle-diff-soft-wrap",
+                                    IconName::TextWrap,
+                                )
+                                .icon_size(IconSize::Small)
+                                .disabled(editor.is_none())
+                                .tooltip(Tooltip::text("Toggle Soft Wrap"))
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        if let Some(commit_view) =
+                                            this.selected_commit_view.as_ref()
+                                        {
+                                            commit_view.update(cx, |commit_view, cx| {
+                                                commit_view.toggle_soft_wrap(window, cx);
+                                            });
+                                        }
+                                    },
+                                )),
+                            )
+                            .children(editor.clone().map(editor::DiffStyleControls::new))
+                            .children(editor.clone().map(|editor| {
+                                ui::PopoverMenu::new("git-graph-diff-more")
+                                    .menu(move |window, cx| {
+                                        let focus = editor.focus_handle(cx);
+                                        Some(ContextMenu::build(window, cx, |menu, _, _| {
+                                            menu.context(focus).action(
+                                                "Collapse/Expand File",
+                                                Box::new(editor::actions::ToggleFoldAll),
+                                            )
+                                        }))
+                                    })
+                                    .trigger_with_tooltip(
+                                        IconButton::new("git-graph-diff-more-trigger", IconName::Ellipsis)
+                                            .icon_size(IconSize::Small),
+                                        Tooltip::text("More File Actions"),
+                                    )
+                            }))
+                            .child(
+                                IconButton::new("open-commit-in-tab", IconName::ArrowUpRight)
+                                    .icon_size(IconSize::Small)
+                                    .disabled(self.active_comparison.is_some())
+                                    .tooltip(Tooltip::text("Open Commit in Tab"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_selected_commit_view(window, cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().overflow_hidden().map(|this| {
+                if let Some(editor) = editor {
+                    this.child(editor)
+                } else if let Some(error) = error {
+                    this.child(
+                        h_flex()
+                            .size_full()
+                            .justify_center()
+                            .child(Label::new(error).color(Color::Error)),
+                    )
+                } else if has_no_changes {
+                    this.child(
+                        h_flex()
+                            .size_full()
+                            .justify_center()
+                            .child(Label::new("No changes").color(Color::Muted)),
+                    )
+                } else if self.selected_commit_diff.is_some()
+                    && self.selected_changed_file.is_none()
+                {
+                    this.child(
+                        h_flex()
+                            .size_full()
+                            .justify_center()
+                            .child(
+                                Label::new("History file not found in this commit. Select a file to view changes.")
+                                    .color(Color::Muted),
+                            ),
+                    )
+                } else {
+                    this.child(
+                        h_flex()
+                            .size_full()
+                            .gap_1()
+                            .justify_center()
+                            .child(Label::new("Loading changes…").color(Color::Muted))
+                            .child(self.render_loading_spinner(cx)),
+                    )
+                }
+            }))
+            .into_any_element()
+    }
+
+    fn render_commit_detail_content(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .size_full()
+            .min_h_0()
+            .on_drag_move::<DraggedDetailContentSplitHandle>(cx.listener(
+                |this, event, window, cx| {
+                    this.detail_content_split_state.update(cx, |state, cx| {
+                        state.on_drag_move(event, window, cx);
+                    });
+                },
+            ))
+            .on_drop::<DraggedDetailContentSplitHandle>(cx.listener(|this, _event, _window, cx| {
+                this.detail_content_split_state.update(cx, |state, _cx| {
+                    state.commit_ratio();
+                });
+                cx.emit(ItemEvent::Edit);
+                cx.notify();
+            }))
+            .child(self.render_commit_detail_panel(window, cx))
+            .child(self.render_detail_content_resize_handle(cx))
+            .child(self.render_commit_diff_panel(cx))
+            .into_any_element()
+    }
+
+    fn render_commit_message(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let Some(DetailPanelCommitMessage {
+            message,
+            scroll_handle,
+            ..
+        }) = self.selected_commit_message.as_ref()
+        else {
+            return Empty.into_any_element();
+        };
+
+        let message_style = editor::hover_markdown_style(window, cx);
+        let rem_size = window.rem_size();
+        let line_height = message_style
+            .base_text_style
+            .line_height_in_pixels(rem_size);
+
+        div()
+            // Using grid over flexbox because the structure of this side
+            // panel prvents taffy from calculating a concrete width correctly,
+            // which causes problems with text reflow when using flexbox.
+            // grid, on the other hand, doesn't appear to give taffy the same
+            // problems.
+            .w_full()
+            .py_2()
+            .pl_2()
+            .grid()
+            .grid_cols(1)
+            .gap_1()
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .child(
+                        div()
+                            .id("commit-message")
+                            .text_sm()
+                            .w_full()
+                            .max_h(line_height * 12.)
+                            .overflow_y_scroll()
+                            .track_scroll(scroll_handle)
+                            .child(MarkdownElement::new(message.clone(), message_style)),
+                    )
+                    .vertical_scrollbar_for(scroll_handle, window, cx),
+            )
+            .into_any_element()
+    }
+}
+
+impl Render for GitGraphNext {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_embedded_search_bar(window, cx);
+        // This happens when we changed branches, we should refresh our search as well
+        if let QueryState::Pending(query) = &mut self.search_state.state {
+            let query = std::mem::take(query);
+            self.search_state.state = QueryState::Empty;
+            self.search(query, cx);
+        }
+        self.initialize_pending_commit_view(window, cx);
+        let (commit_count, is_loading) = self.commit_count_and_loading_state(cx);
+
+        let error = self.get_repository(cx).and_then(|repo| {
+            repo.read(cx)
+                .get_graph_data(self.log_source.clone(), self.log_order)
+                .and_then(|data| data.error.clone())
+        });
+
+        let content = if commit_count == 0 {
+            let message = if let Some(error) = &error {
+                format!("Error loading: {}", error)
+            } else if is_loading {
+                "Loading".to_string()
+            } else {
+                "No commits found".to_string()
+            };
+            let label = Label::new(message)
+                .color(Color::Muted)
+                .size(LabelSize::Large);
+
+            h_flex()
+                .size_full()
+                .gap_1()
+                .justify_center()
+                .child(label)
+                .when(is_loading && error.is_none(), |this| {
+                    this.child(self.render_loading_spinner(cx))
+                })
+        } else {
+            let is_path_history = matches!(self.log_source, LogSource::Path(_));
+            let header_resize_info =
+                HeaderResizeInfo::from_redistributable(&self.column_widths, cx);
+
+            let column_filter = self.column_visibility.clone();
+
+            // The graph column (index 0) only exists in the non-path-history layout and is
+            // rendered as a separate canvas outside the table.
+            let graph_visible =
+                is_path_history || !column_filter.get(0usize).copied().unwrap_or(false);
+
+            let table_offset = if is_path_history { 0 } else { 1 };
+            let table_filter = column_filter
+                .as_slice()
+                .get(table_offset..table_offset + TABLE_COLUMN_COUNT)
+                .map(|slice| TableRow::from_vec(slice.to_vec(), TABLE_COLUMN_COUNT))
+                .unwrap_or_else(|| TableRow::from_element(false, TABLE_COLUMN_COUNT));
+            let header_widths = redistribute_hidden_widths(
+                &self.column_widths.read(cx).widths_to_render(),
+                Some(&column_filter),
+            );
+            let header_context = TableRenderContext::for_column_widths(Some(header_widths), true)
+                .with_column_filter(Some(column_filter));
+
+            let [
+                graph_fraction,
+                description_fraction,
+                date_fraction,
+                author_fraction,
+                commit_fraction,
+            ] = self.preview_column_fractions(window, cx);
+            let table_fraction =
+                description_fraction + date_fraction + author_fraction + commit_fraction;
+            let table_width_config = self.table_column_width_config(window, cx);
+
+            let table_collapsed = table_fraction <= f32::EPSILON;
+            let graph_content_width = self.graph_canvas_content_width();
+
+            let has_detail = self.selected_entry_idx.is_some();
+            let top_ratio = self.graph_detail_split_state.read(cx).visible_top_ratio();
+            let bottom_ratio = self.graph_detail_split_state.read(cx).bottom_ratio();
+
+            v_flex()
+                .size_full()
+                .on_drag_move::<DraggedGraphDetailSplitHandle>(cx.listener(
+                    |this, event, window, cx| {
+                        this.graph_detail_split_state.update(cx, |state, cx| {
+                            state.on_drag_move(event, window, cx);
+                        });
+                    },
+                ))
+                .on_drop::<DraggedGraphDetailSplitHandle>(cx.listener(
+                    |this, _event, _window, cx| {
+                        this.graph_detail_split_state.update(cx, |state, _cx| {
+                            state.commit_ratio();
+                        });
+                        cx.emit(ItemEvent::Edit);
+                        cx.notify();
+                    },
+                ))
+                .child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .min_h_0()
+                        .when(has_detail, |this| {
+                            this.flex_basis(DefiniteLength::Fraction(top_ratio))
+                        })
+                        .when(!has_detail, |this| this.flex_1())
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                        this.deploy_header_context_menu(event.position, window, cx);
+                                        cx.stop_propagation();
+                                    }),
+                                )
+                                .child(render_table_header(
+                                    if !is_path_history {
+                                        TableRow::from_vec(
+                                            vec![
+                                                Label::new("Graph")
+                                                    .color(Color::Muted)
+                                                    .truncate()
+                                                    .into_any_element(),
+                                                Label::new("Description")
+                                                    .color(Color::Muted)
+                                                    .into_any_element(),
+                                                Label::new("Date")
+                                                    .color(Color::Muted)
+                                                    .into_any_element(),
+                                                Label::new("Author")
+                                                    .color(Color::Muted)
+                                                    .into_any_element(),
+                                                Label::new("Commit")
+                                                    .color(Color::Muted)
+                                                    .into_any_element(),
+                                            ],
+                                            5,
+                                        )
+                                    } else {
+                                        TableRow::from_vec(
+                                            vec![
+                                                Label::new("Description")
+                                                    .color(Color::Muted)
+                                                    .into_any_element(),
+                                                Label::new("Date")
+                                                    .color(Color::Muted)
+                                                    .into_any_element(),
+                                                Label::new("Author")
+                                                    .color(Color::Muted)
+                                                    .into_any_element(),
+                                                Label::new("Commit")
+                                                    .color(Color::Muted)
+                                                    .into_any_element(),
+                                            ],
+                                            4,
+                                        )
+                                    },
+                                    header_context,
+                                    Some(header_resize_info),
+                                    Some(self.column_widths.entity_id()),
+                                    cx,
+                                )),
+                        )
+                        .child({
+                            let row_height = Self::row_height(window, cx);
+                            let selected_entry_idx = self.selected_entry_idx.filter(|_| self.comparison.is_none());
+                            let comparison_indices = self.comparison_indices();
+                            let hovered_entry_idx = self.hovered_entry_idx;
+                            let context_menu_target_index = self
+                                .context_menu
+                                .as_ref()
+                                .and_then(|menu| menu.target_entry_index);
+                            let weak_self = cx.weak_entity();
+                            let focus_handle = self.focus_handle.clone();
+                            let table_focus_handle =
+                                self.table_interaction_state.read(cx).focus_handle.clone();
+
+                            let graph_canvas = div()
+                                .id("graph-canvas")
+                                .size_full()
+                                .overflow_hidden()
+                                .cursor_pointer()
+                                .child(
+                                    div()
+                                        .size_full()
+                                        .child(self.render_graph_canvas(window, cx)),
+                                )
+                                .on_scroll_wheel(cx.listener(Self::handle_graph_scroll))
+                                .on_mouse_move(cx.listener(Self::handle_graph_mouse_move))
+                                .on_click(cx.listener(Self::handle_graph_click))
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(Self::handle_graph_secondary_mouse_down),
+                                )
+                                .on_hover(cx.listener(|this, &is_hovered: &bool, _, cx| {
+                                    if !is_hovered && this.hovered_entry_idx.is_some() {
+                                        this.hovered_entry_idx = None;
+                                        cx.notify();
+                                    }
+                                }));
+
+                            let commits_table = Table::new(4)
+                                .interactable(&self.table_interaction_state)
+                                .hide_row_borders()
+                                .hide_row_hover()
+                                .width_config(table_width_config)
+                                .column_filter(table_filter)
+                                .map_row(move |(index, row), window, cx| {
+                                    let is_selected = selected_entry_idx == Some(index)
+                                        || comparison_indices.contains(&Some(index));
+                                    let is_hovered = hovered_entry_idx == Some(index);
+                                    let is_context_menu_target =
+                                        context_menu_target_index == Some(index);
+                                    let table_focus_handle = table_focus_handle.clone();
+                                    let is_focused = focus_handle.is_focused(window)
+                                        || table_focus_handle.is_focused(window);
+                                    let weak = weak_self.clone();
+                                    let weak_for_hover = weak.clone();
+                                    let weak_for_context_menu = weak.clone();
+
+                                    let hover_bg = cx.theme().colors().element_hover.opacity(0.6);
+                                    let selected_bg = if is_focused {
+                                        cx.theme().colors().element_selected
+                                    } else {
+                                        cx.theme().colors().element_hover
+                                    };
+
+                                    row.h(row_height)
+                                        .cursor_pointer()
+                                        .when(is_selected || is_context_menu_target, |row| {
+                                            row.bg(selected_bg)
+                                        })
+                                        .when(
+                                            is_hovered && !is_selected && !is_context_menu_target,
+                                            |row| row.bg(hover_bg),
+                                        )
+                                        .on_hover(move |&is_hovered, _, cx| {
+                                            weak_for_hover
+                                                .update(cx, |this, cx| {
+                                                    if is_hovered {
+                                                        if this.hovered_entry_idx != Some(index) {
+                                                            this.hovered_entry_idx = Some(index);
+                                                            cx.notify();
+                                                        }
+                                                    } else if this.hovered_entry_idx == Some(index)
+                                                    {
+                                                        this.hovered_entry_idx = None;
+                                                        cx.notify();
+                                                    }
+                                                })
+                                                .ok();
+                                        })
+                                        .on_click(move |event, window, cx| {
+                                            weak.update(cx, |this, cx| {
+                                                this.handle_entry_click(
+                                                    index,
+                                                    event,
+                                                    ScrollStrategy::Center,
+                                                    Some(&table_focus_handle),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })
+                                            .ok();
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Right,
+                                            move |event: &MouseDownEvent, window, cx| {
+                                                weak_for_context_menu
+                                                    .update(cx, |this, cx| {
+                                                        this.handle_entry_secondary_mouse_down(
+                                                            index, event, window, cx,
+                                                        );
+                                                    })
+                                                    .ok();
+                                            },
+                                        )
+                                        .into_any_element()
+                                })
+                                .uniform_list(
+                                    "git-graph-commits",
+                                    commit_count,
+                                    cx.processor(Self::render_table_rows),
+                                );
+
+                            bind_redistributable_columns(
+                                div()
+                                    .relative()
+                                    .flex_1()
+                                    .w_full()
+                                    .overflow_hidden()
+                                    .child(
+                                        h_flex()
+                                            .size_full()
+                                            .when(!is_path_history && graph_visible, |this| {
+                                                this.child(
+                                                    div()
+                                                        .map(|this| {
+                                                            if table_collapsed {
+                                                                this.w(graph_content_width)
+                                                            } else {
+                                                                this.w(DefiniteLength::Fraction(
+                                                                    graph_fraction,
+                                                                ))
+                                                            }
+                                                        })
+                                                        .h_full()
+                                                        .min_w_0()
+                                                        .overflow_hidden()
+                                                        .child(graph_canvas),
+                                                )
+                                            })
+                                            .child(
+                                                div()
+                                                    .tab_index(2)
+                                                    .tab_group()
+                                                    .tab_stop(false)
+                                                    .map(|this| {
+                                                        if table_collapsed {
+                                                            this.flex_1()
+                                                        } else {
+                                                            this.w(DefiniteLength::Fraction(
+                                                                table_fraction,
+                                                            ))
+                                                        }
+                                                    })
+                                                    .h_full()
+                                                    .min_w_0()
+                                                    .child(commits_table),
+                                            ),
+                                    )
+                                    .child(render_redistributable_columns_resize_handles(
+                                        &self.column_widths,
+                                        Some(&self.column_visibility),
+                                        window,
+                                        cx,
+                                    )),
+                                self.column_widths.clone(),
+                                Some(self.column_visibility.clone()),
+                            )
+                        }),
+                )
+                .when(has_detail, |this| {
+                    this.child(self.render_graph_detail_resize_handle(cx))
+                        .child(
+                            div()
+                                .w_full()
+                                .min_h_0()
+                                .flex_basis(DefiniteLength::Fraction(bottom_ratio))
+                                .child(self.render_commit_detail_content(window, cx)),
+                        )
+                })
+        };
+
+        div()
+            // Do not apply graph navigation bindings (such as Vim j/k) to the query editor.
+            .key_context(if self.embedded_search_is_focused(window, cx) {
+                "GitGraphNextDiffSearch"
+            } else {
+                "GitGraph"
+            })
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .bg(cx.theme().colors().editor_background)
+            .on_action(cx.listener(|this, _: &OpenCommitView, window, cx| {
+                this.open_selected_commit_view(window, cx);
+            }))
+            .on_action(cx.listener(Self::copy_selected_commit_sha))
+            .on_action(cx.listener(Self::copy_selected_commit_tag))
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                this.search_state
+                    .editor
+                    .update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
+                this.activate_search_editor_if_focused(window, cx);
+            }))
+            .on_action(cx.listener(Self::select_first))
+            .on_action(cx.listener(Self::select_prev))
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_last))
+            .on_action(cx.listener(Self::scroll_up))
+            .on_action(cx.listener(Self::scroll_down))
+            .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::toggle_changed_files_view))
+            .on_action(cx.listener(Self::focus_next_tab_stop))
+            .on_action(cx.listener(Self::focus_previous_tab_stop))
+            .on_action(
+                cx.listener(|this, _: &crate::git_graph::FocusNextTabStop, window, cx| {
+                    window.focus_next(cx);
+                    this.activate_search_editor_if_focused(window, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &crate::git_graph::FocusPreviousTabStop, window, cx| {
+                    window.focus_prev(cx);
+                    this.activate_search_editor_if_focused(window, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                },
+            ))
+            .on_action(cx.listener(|this, _: &SelectNextMatch, window, cx| {
+                if this.diff_search_is_focused(window, cx) {
+                    cx.propagate();
+                } else {
+                    this.select_next_match(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SelectPreviousMatch, window, cx| {
+                if this.diff_search_is_focused(window, cx) {
+                    cx.propagate();
+                } else {
+                    this.select_previous_match(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleCaseSensitive, window, cx| {
+                if this.diff_search_is_focused(window, cx) {
+                    cx.propagate();
+                    return;
+                }
+                this.search_state.case_sensitive = !this.search_state.case_sensitive;
+                this.search_state.state.next_state();
+                cx.emit(ItemEvent::Edit);
+                cx.notify();
+            }))
+            .child(
+                v_flex()
+                    .size_full()
+                    .child(self.render_search_bar(cx))
+                    .child(div().flex_1().child(content)),
+            )
+            .children(self.context_menu.as_ref().map(|context_menu| {
+                deferred(
+                    anchored()
+                        .position(context_menu.position)
+                        .anchor(Anchor::TopLeft)
+                        .child(context_menu.menu.clone()),
+                )
+                .with_priority(1)
+            }))
+            .on_action(cx.listener(|this, _: &buffer_search::Deploy, window, cx| {
+                if this.diff_search_is_focused(window, cx) {
+                    cx.propagate();
+                } else {
+                    window.dispatch_action(Box::new(FocusSearch), cx);
+                    cx.stop_propagation();
+                }
+            }))
+    }
+}
+
+impl EventEmitter<ItemEvent> for GitGraphNext {}
+
+impl Focusable for GitGraphNext {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        if !self.graph_data.commits.is_empty() {
+            match self.last_focused_region {
+                GitGraphNextFocus::Table => {
+                    return self.table_interaction_state.read(cx).focus_handle.clone();
+                }
+                GitGraphNextFocus::Diff => {
+                    if self.selected_entry_idx.is_some()
+                        && self.selected_commit_diff_error.is_none()
+                        && let Some(view) = &self.selected_commit_view
+                        && view.read(cx).load_error().is_none()
+                    {
+                        return view.read(cx).editor().focus_handle(cx);
+                    }
+                }
+                GitGraphNextFocus::Graph => {}
+            }
+        }
+        self.focus_handle.clone()
+    }
+}
+
+impl Item for GitGraphNext {
+    type Event = ItemEvent;
+
+    fn act_as_type<'a>(
+        &'a self,
+        type_id: std::any::TypeId,
+        self_handle: &'a Entity<Self>,
+        cx: &'a App,
+    ) -> Option<gpui::AnyEntity> {
+        if type_id == std::any::TypeId::of::<Self>() {
+            Some(self_handle.clone().into())
+        } else if type_id == std::any::TypeId::of::<editor::SplittableEditor>() {
+            self.diff_view
+                .as_ref()
+                .map(|commit_view| commit_view.read(cx).editor().into())
+        } else if type_id == std::any::TypeId::of::<Editor>() {
+            self.diff_view.as_ref().map(|commit_view| {
+                commit_view
+                    .read(cx)
+                    .editor()
+                    .read(cx)
+                    .rhs_editor()
+                    .clone()
+                    .into()
+            })
+        } else {
+            None
+        }
+    }
+
+    fn as_searchable(
+        &self,
+        _: &Entity<Self>,
+        cx: &App,
+    ) -> Option<Box<dyn workspace::searchable::SearchableItemHandle>> {
+        self.diff_view.as_ref().map(|commit_view| {
+            Box::new(commit_view.read(cx).editor())
+                as Box<dyn workspace::searchable::SearchableItemHandle>
+        })
+    }
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        Some(Icon::new(IconName::GitGraph))
+    }
+
+    fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {
+        let repo_name = self.get_repository(cx).and_then(|repo| {
+            repo.read(cx)
+                .work_directory_abs_path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        });
+        let path_history_path = match &self.log_source {
+            LogSource::Path(path) => Some(path.as_unix_str().to_string()),
+            _ => None,
+        };
+
+        Some(TabTooltipContent::Custom(Box::new(Tooltip::element({
+            move |_, _| {
+                v_flex()
+                    .child(Label::new(if path_history_path.is_some() {
+                        "Path History"
+                    } else {
+                        "Git Graph Next"
+                    }))
+                    .when_some(path_history_path.clone(), |this, path| {
+                        this.child(Label::new(path).color(Color::Muted).size(LabelSize::Small))
+                    })
+                    .when_some(repo_name.clone(), |this, name| {
+                        this.child(Label::new(name).color(Color::Muted).size(LabelSize::Small))
+                    })
+                    .into_any_element()
+            }
+        }))))
+    }
+
+    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
+        if let LogSource::Path(path) = &self.log_source {
+            return path
+                .as_ref()
+                .file_name()
+                .map(|name| SharedString::from(name.to_string()))
+                .unwrap_or_else(|| SharedString::from(path.as_unix_str().to_string()));
+        }
+
+        self.get_repository(cx)
+            .and_then(|repo| {
+                repo.read(cx)
+                    .work_directory_abs_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            })
+            .map_or_else(|| "Git Graph Next".into(), |name| SharedString::from(name))
+    }
+
+    fn show_toolbar(&self) -> bool {
+        false
+    }
+
+    fn embeds_buffer_search(&self) -> bool {
+        true
+    }
+
+    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
+        f(*event)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    fn changed_file(path: &str) -> super::ChangedFileEntry {
+        super::ChangedFileEntry {
+            status: git::status::FileStatus::Tracked(git::status::TrackedStatus {
+                index_status: git::status::StatusCode::Modified,
+                worktree_status: git::status::StatusCode::Unmodified,
+            }),
+            file_name: path
+                .rsplit('/')
+                .next()
+                .expect("file name")
+                .to_owned()
+                .into(),
+            dir_path: "".into(),
+            repo_path: git::repository::RepoPath::new(path).expect("valid repository path"),
+            diff_stats: Some((1, 1)),
+        }
+    }
+
+    #[test]
+    fn sticky_ancestors_follow_compacted_visible_tree() {
+        let files = vec![
+            changed_file("src/a.rs"),
+            changed_file("src/nested/deep/one.rs"),
+            changed_file("src/nested/deep/two.rs"),
+            changed_file("src/sibling/three.rs"),
+            changed_file("tests/test.rs"),
+            changed_file("root.rs"),
+        ];
+        let entries = super::build_changed_file_tree_entries(files.clone(), &Default::default());
+        let parents = super::changed_file_parent_indices(&entries);
+        for (index, entry) in entries.iter().enumerate() {
+            let ancestors = super::changed_file_ancestor_indices(&parents, index);
+            assert_eq!(ancestors.len(), entry.depth());
+            assert!(ancestors.iter().all(|parent| *parent < index));
+            let paths = ancestors
+                .iter()
+                .map(|parent| match &entries[*parent] {
+                    super::ChangedFileTreeEntry::Directory(directory) => {
+                        directory.path.as_unix_str()
+                    }
+                    _ => panic!("sticky ancestors must be directories"),
+                })
+                .collect::<Vec<_>>();
+            if let super::ChangedFileTreeEntry::File(file) = entry {
+                match file.entry.repo_path.as_unix_str() {
+                    "src/nested/deep/one.rs" | "src/nested/deep/two.rs" => {
+                        assert_eq!(paths, vec!["src", "src/nested/deep"]);
+                    }
+                    "src/sibling/three.rs" => assert_eq!(paths, vec!["src", "src/sibling"]),
+                    "src/a.rs" => assert_eq!(paths, vec!["src"]),
+                    "tests/test.rs" => assert_eq!(paths, vec!["tests"]),
+                    "root.rs" => assert!(paths.is_empty()),
+                    _ => panic!("unexpected file"),
+                }
+            }
+        }
+        let mut expanded = collections::HashMap::default();
+        expanded.insert(
+            git::repository::RepoPath::new("src/nested/deep").expect("path"),
+            false,
+        );
+        let collapsed = super::build_changed_file_tree_entries(files, &expanded);
+        let parents = super::changed_file_parent_indices(&collapsed);
+        for (index, entry) in collapsed.iter().enumerate() {
+            assert_eq!(
+                super::changed_file_ancestor_indices(&parents, index).len(),
+                entry.depth()
+            );
+        }
+        assert!(super::changed_file_ancestor_indices(&parents, collapsed.len()).is_empty());
+        assert!(super::changed_file_parent_indices(&[]).is_empty());
+    }
+
+    #[gpui::test]
+    async fn graph_focus_comparison_and_diff_search(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            language_model::init(cx);
+            editor::init(cx);
+            crate::init(cx);
+            search::buffer_search::init(cx);
+            tab_switcher::init(cx);
+            vim::init(cx);
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        let root = std::path::Path::new(util::path!("/project"));
+        fs.insert_tree(
+            root,
+            serde_json::json!({".git": {}, "first.rs": "", "second.rs": ""}),
+        )
+        .await;
+        let commits = [1, 2].map(|byte| git::Oid::from_bytes(&[byte; 20]).expect("SHA"));
+        fs.set_graph_commits(
+            &root.join(".git"),
+            commits
+                .iter()
+                .map(|sha| {
+                    std::sync::Arc::new(git::repository::InitialGraphCommitData {
+                        sha: *sha,
+                        parents: Default::default(),
+                        ref_names: Vec::new(),
+                    })
+                })
+                .collect(),
+        );
+        fs.set_commit_data(
+            &root.join(".git"),
+            commits.iter().map(|sha| {
+                (
+                    git::repository::CommitData {
+                        sha: *sha,
+                        parents: Default::default(),
+                        author_name: "Author".into(),
+                        author_email: "author@example.com".into(),
+                        commit_timestamp: 1_700_000_000,
+                        subject: "Subject".into(),
+                        message: "Message".into(),
+                    },
+                    false,
+                )
+            }),
+        );
+        let project = project::Project::test(fs, [root], cx).await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project.active_repository(cx).expect("repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(1000.)));
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        let graph = workspace.update_in(cx, |workspace, window, cx| {
+            super::open_or_reuse_graph_next(
+                workspace,
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                git::repository::LogSource::All,
+                None,
+                window,
+                cx,
+            );
+            workspace
+                .active_item_as::<super::GitGraphNext>(cx)
+                .expect("graph item")
+        });
+        cx.run_until_parked();
+        let search_bar = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(graph.clone()), None, true, window, cx);
+            let search_bar =
+                gpui::AppContext::new(cx, |cx| search::BufferSearchBar::new(None, window, cx));
+            workspace.active_pane().update(cx, |pane, cx| {
+                pane.toolbar().update(cx, |toolbar, cx| {
+                    toolbar.add_item(search_bar.clone(), window, cx)
+                });
+            });
+            search_bar
+        });
+        graph.update_in(cx, |graph, window, cx| {
+            assert!(graph.focus_handle.is_focused(window));
+            assert!(
+                !gpui::Focusable::focus_handle(&graph.search_state.editor, cx).is_focused(window)
+            );
+            assert!(workspace::item::Item::as_searchable(graph, &cx.entity(), cx).is_some());
+            graph.select_entry(0, gpui::ScrollStrategy::Nearest, cx);
+            gpui::Focusable::focus_handle(&graph.search_state.editor, cx).focus(window, cx);
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(editor::actions::Cancel);
+        graph.update_in(cx, |graph, window, _| {
+            assert!(graph.focus_handle.is_focused(window));
+            assert_eq!(graph.selected_entry_idx, Some(0));
+        });
+
+        for modifiers in [
+            gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        ] {
+            graph.update_in(cx, |graph, window, cx| {
+                let event = gpui::ClickEvent::Mouse(gpui::MouseClickEvent {
+                    down: gpui::MouseDownEvent {
+                        button: gpui::MouseButton::Left,
+                        ..Default::default()
+                    },
+                    up: gpui::MouseUpEvent {
+                        button: gpui::MouseButton::Left,
+                        modifiers,
+                        ..Default::default()
+                    },
+                });
+                graph.handle_entry_click(
+                    1,
+                    &event,
+                    gpui::ScrollStrategy::Nearest,
+                    None,
+                    window,
+                    cx,
+                );
+                assert_eq!(graph.comparison, Some((commits[0], commits[1])));
+                assert_eq!(graph.comparison_indices(), [Some(0), Some(1)]);
+                graph.deploy_entry_context_menu(
+                    gpui::point(gpui::px(0.), gpui::px(0.)),
+                    1,
+                    None,
+                    window,
+                    cx,
+                );
+                assert!(graph.context_menu.is_some());
+                assert_eq!(graph.comparison, Some((commits[0], commits[1])));
+            });
+            cx.dispatch_action(menu::SelectFirst);
+            cx.dispatch_action(menu::Confirm);
+            graph.update_in(cx, |graph, _, cx| {
+                assert_eq!(graph.active_comparison, Some((commits[0], commits[1])));
+                graph.select_entry(0, gpui::ScrollStrategy::Nearest, cx);
+                assert_eq!(graph.comparison, None);
+                assert_eq!(graph.active_comparison, None);
+            });
+        }
+        cx.run_until_parked();
+
+        let split_editor = graph.read_with(cx, |graph, cx| {
+            graph
+                .diff_view
+                .as_ref()
+                .expect("stable diff")
+                .read(cx)
+                .editor()
+        });
+        let files = [
+            ("first.rs", "oldneedle\n", "newneedle\n"),
+            ("second.rs", "before\n", "secondneedle\nsecondneedle\n"),
+        ]
+        .map(|(path, old, new)| project::git_store::CommitFile {
+            path: git::repository::RepoPath::new(path).expect("file path"),
+            old_text: Some(old.into()),
+            new_text: Some(new.into()),
+            is_binary: false,
+        });
+        graph.update_in(cx, |graph, window, cx| {
+            graph._commit_diff_task = None;
+            graph.selected_commit_files = files
+                .iter()
+                .map(|file| super::ChangedFileEntry::from_commit_file(file, cx))
+                .collect();
+            graph.selected_commit_diff = Some(project::git_store::CommitDiff {
+                files: files
+                    .iter()
+                    .map(|file| project::git_store::CommitFile {
+                        path: file.path.clone(),
+                        old_text: file.old_text.clone(),
+                        new_text: file.new_text.clone(),
+                        is_binary: file.is_binary,
+                    })
+                    .collect(),
+                is_shallow_boundary: false,
+                history_path: None,
+            });
+            graph.select_changed_file(files[0].path.clone(), window, cx);
+            graph.initialize_pending_commit_view(window, cx);
+        });
+        cx.run_until_parked();
+        cx.refresh().expect("render diff");
+        split_editor.update_in(cx, |editor, window, cx| {
+            if editor.diff_view_style() != editor::DiffViewStyle::Unified {
+                editor.toggle_split(&editor::ToggleSplitDiff, window, cx);
+            }
+            gpui::Focusable::focus_handle(editor.rhs_editor(), cx).focus(window, cx);
+        });
+        cx.dispatch_action(zed_actions::buffer_search::Deploy::find());
+        cx.run_until_parked();
+        assert!(!search_bar.read_with(cx, |bar, _| bar.is_dismissed()));
+        for width in [1600., 1100., 1600.] {
+            cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(1000.)));
+            cx.refresh().expect("layout inline search");
+            cx.refresh().expect("layout narrow search options");
+            let header = cx
+                .debug_bounds("git-graph-diff-header")
+                .expect("file header");
+            let search = cx.debug_bounds("buffer-search-bar").expect("inline search");
+            assert!(header.contains(&search.origin));
+            assert!(search.right() <= header.right());
+            assert!(search.bottom() <= header.bottom());
+            assert_eq!(search.size.width, gpui::px(480.));
+            let path = cx.debug_bounds("git-graph-diff-path").expect("file path");
+            let actions = cx
+                .debug_bounds("git-graph-diff-actions")
+                .expect("file actions");
+            assert!(path.size.width >= cx.update(|window, _| window.rem_size() * 12.));
+            assert!(path.right() < search.left());
+            assert!(search.right() < actions.left());
+            if width == 1600. {
+                assert!((search.center().x - header.center().x).abs() <= gpui::px(1.));
+            }
+            assert!(cx.debug_bounds("pane-toolbar").is_none());
+        }
+        cx.simulate_resize(gpui::size(gpui::px(480.), gpui::px(1000.)));
+        cx.refresh().expect("narrow file header");
+        let header = cx
+            .debug_bounds("git-graph-diff-header")
+            .expect("file header");
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: header.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(-2000.), gpui::px(0.))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.refresh().expect("scroll to file actions");
+        let actions = cx
+            .debug_bounds("git-graph-diff-actions")
+            .expect("file actions");
+        assert!(actions.right() <= header.right());
+        cx.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(1000.)));
+        cx.refresh().expect("restore header width");
+        graph.read_with(cx, |graph, _| {
+            assert_eq!(
+                graph
+                    .embedded_search_bar
+                    .as_ref()
+                    .expect("pane search")
+                    .0
+                    .entity_id(),
+                search_bar.entity_id()
+            );
+        });
+        for query in ["newneedle", "oldneedle"] {
+            search_bar
+                .update_in(cx, |bar, window, cx| {
+                    bar.search(query, None, false, window, cx)
+                })
+                .await
+                .expect("unified search");
+            assert!(search_bar.read_with(cx, |bar, _| bar.has_active_match()));
+        }
+
+        graph.update(cx, |graph, _| {
+            graph.search_state.matches.extend(commits);
+            graph.search_state.selected_index = Some(0);
+        });
+        cx.update(|window, cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new(
+                    "j",
+                    menu::SelectNext,
+                    Some("GitGraph && !GitGraphSearchBar"),
+                ),
+                gpui::KeyBinding::new(
+                    "k",
+                    menu::SelectPrevious,
+                    Some("GitGraph && !GitGraphSearchBar"),
+                ),
+            ]);
+            gpui::Focusable::focus_handle(&search_bar, cx).focus(window, cx);
+        });
+        cx.dispatch_action(editor::actions::SelectAll);
+        cx.simulate_keystrokes("j k");
+        assert_eq!(search_bar.read_with(cx, |bar, cx| bar.query(cx)), "jk");
+        cx.dispatch_action(zed_actions::buffer_search::Deploy::find());
+        cx.dispatch_action(zed_actions::buffer_search::DeployReplace);
+        cx.dispatch_action(search::ToggleReplace);
+        cx.dispatch_action(editor::actions::Tab);
+        graph.update_in(cx, |graph, window, cx| {
+            assert!(graph.diff_is_focused(window, cx));
+        });
+        cx.dispatch_action(zed_actions::buffer_search::Deploy::find());
+        cx.dispatch_action(zed_actions::search::ToggleCaseSensitive);
+        graph.update_in(cx, |graph, window, cx| {
+            assert!(graph.embedded_search_is_focused(window, cx));
+            assert_eq!(graph.selected_entry_idx, Some(0));
+            assert!(!graph.search_state.case_sensitive);
+        });
+        assert!(search_bar.update(cx, |bar, _| {
+            bar.has_search_option(search::SearchOptions::CASE_SENSITIVE)
+        }));
+        cx.dispatch_action(zed_actions::search::ToggleCaseSensitive);
+        search_bar
+            .update_in(cx, |bar, window, cx| {
+                bar.search("oldneedle", None, false, window, cx)
+            })
+            .await
+            .expect("restore diff query");
+        split_editor.update_in(cx, |editor, window, cx| {
+            gpui::Focusable::focus_handle(editor.rhs_editor(), cx).focus(window, cx);
+        });
+        cx.dispatch_action(zed_actions::search::SelectNextMatch);
+        assert_eq!(
+            graph.read_with(cx, |graph, _| graph.selected_entry_idx),
+            Some(0)
+        );
+        cx.dispatch_action(zed_actions::search::SelectPreviousMatch);
+        cx.dispatch_action(zed_actions::search::ToggleCaseSensitive);
+        graph.read_with(cx, |graph, _| {
+            assert_eq!(graph.selected_entry_idx, Some(0));
+            assert!(!graph.search_state.case_sensitive);
+        });
+        search_bar.update(cx, |bar, _| {
+            assert!(bar.has_search_option(search::SearchOptions::CASE_SENSITIVE));
+        });
+        split_editor.update_in(cx, |editor, window, cx| {
+            editor.toggle_split(&editor::ToggleSplitDiff, window, cx);
+        });
+        cx.refresh().expect("render split");
+        cx.run_until_parked();
+        for (left, query) in [(true, "oldneedle"), (false, "newneedle")] {
+            search_bar.update_in(cx, |bar, window, cx| {
+                bar.dismiss(&search::buffer_search::Dismiss, window, cx)
+            });
+            split_editor.update_in(cx, |editor, window, cx| {
+                let side = if left {
+                    editor.lhs_editor().expect("left editor")
+                } else {
+                    editor.rhs_editor()
+                };
+                gpui::Focusable::focus_handle(side, cx).focus(window, cx);
+            });
+            cx.dispatch_action(zed_actions::buffer_search::Deploy::find());
+            search_bar
+                .update_in(cx, |bar, window, cx| {
+                    bar.search(query, None, false, window, cx)
+                })
+                .await
+                .expect("split search");
+            assert!(search_bar.read_with(cx, |bar, _| bar.has_active_match()));
+        }
+
+        graph.update_in(cx, |graph, window, cx| {
+            graph.select_changed_file(files[1].path.clone(), window, cx);
+            graph.initialize_pending_commit_view(window, cx);
+            graph.toggle_showing_all_diff_lines(cx);
+        });
+        cx.run_until_parked();
+        assert!(!search_bar.read_with(cx, |bar, _| bar.has_active_match()));
+        graph.read_with(cx, |graph, cx| {
+            assert_eq!(
+                graph
+                    .selected_commit_view
+                    .as_ref()
+                    .expect("current diff")
+                    .read(cx)
+                    .editor(),
+                split_editor
+            );
+        });
+        search_bar
+            .update_in(cx, |bar, window, cx| {
+                bar.search("secondneedle", None, false, window, cx)
+            })
+            .await
+            .expect("search new file");
+        assert!(search_bar.read_with(cx, |bar, _| bar.has_active_match()));
+        search_bar
+            .update_in(cx, |bar, window, cx| {
+                bar.search("newneedle", None, false, window, cx)
+            })
+            .await
+            .expect("old file is gone");
+        assert!(!search_bar.read_with(cx, |bar, _| bar.has_active_match()));
+
+        graph.update_in(cx, |graph, window, cx| {
+            graph.select_changed_file(files[0].path.clone(), window, cx);
+            graph.initialize_pending_commit_view(window, cx);
+            graph.select_changed_file(files[1].path.clone(), window, cx);
+            graph.initialize_pending_commit_view(window, cx);
+        });
+        cx.run_until_parked();
+        search_bar
+            .update_in(cx, |bar, window, cx| {
+                bar.search("secondneedle", None, false, window, cx)
+            })
+            .await
+            .expect("latest file wins");
+        assert!(search_bar.read_with(cx, |bar, _| bar.has_active_match()));
+        search_bar.update_in(cx, |bar, window, cx| {
+            bar.dismiss(&search::buffer_search::Dismiss, window, cx);
+        });
+        let other = workspace.update_in(cx, |workspace, window, cx| {
+            let other = gpui::AppContext::new(cx, |cx| editor::Editor::single_line(window, cx));
+            workspace.add_item_to_active_pane(Box::new(other.clone()), None, true, window, cx);
+            workspace.activate_item(&graph, true, true, window, cx);
+            other
+        });
+        let switch_away_and_back =
+            |cx: &mut gpui::VisualTestContext, expected: &gpui::FocusHandle| {
+                let searching = !search_bar.read_with(cx, |bar, _| bar.is_dismissed());
+                cx.dispatch_action(tab_switcher::Toggle::default());
+                workspace.read_with(cx, |workspace, cx| {
+                    assert!(
+                        workspace
+                            .active_modal::<tab_switcher::TabSwitcher>(cx)
+                            .is_some()
+                    );
+                });
+                cx.dispatch_action(menu::Confirm);
+                workspace.read_with(cx, |workspace, cx| {
+                    assert_eq!(
+                        workspace.active_item_as::<editor::Editor>(cx),
+                        Some(other.clone())
+                    );
+                });
+                cx.refresh().expect("render ordinary editor");
+                if searching {
+                    assert!(cx.debug_bounds("pane-toolbar").is_some());
+                    assert!(cx.debug_bounds("buffer-search-bar").is_some());
+                }
+                cx.dispatch_action(tab_switcher::Toggle::default());
+                cx.dispatch_action(menu::Confirm);
+                workspace.read_with(cx, |workspace, cx| {
+                    assert_eq!(
+                        workspace.active_item_as::<super::GitGraphNext>(cx),
+                        Some(graph.clone())
+                    );
+                });
+                cx.refresh().expect("restore graph header");
+                assert!(cx.debug_bounds("pane-toolbar").is_none());
+                if searching {
+                    assert!(cx.debug_bounds("buffer-search-bar").is_some());
+                }
+                cx.update(|window, _| assert!(expected.is_focused(window)));
+            };
+        for split in [false, true] {
+            split_editor.update_in(cx, |editor, window, cx| {
+                if (editor.diff_view_style() == editor::DiffViewStyle::Split) != split {
+                    editor.toggle_split(&editor::ToggleSplitDiff, window, cx);
+                }
+            });
+            cx.refresh().expect("render diff style");
+            for left in [false, true].into_iter().filter(|left| !left || split) {
+                let focus = split_editor.read_with(cx, |editor, cx| {
+                    let editor = if left {
+                        editor.lhs_editor().expect("left editor")
+                    } else {
+                        editor.rhs_editor()
+                    };
+                    gpui::Focusable::focus_handle(editor, cx)
+                });
+                cx.update(|window, cx| focus.focus(window, cx));
+                switch_away_and_back(cx, &focus);
+            }
+        }
+
+        let (root_focus, table_focus, search_focus) = graph.read_with(cx, |graph, cx| {
+            (
+                graph.focus_handle.clone(),
+                graph.table_interaction_state.read(cx).focus_handle.clone(),
+                gpui::Focusable::focus_handle(&graph.search_state.editor, cx),
+            )
+        });
+        for focus in [&root_focus, &table_focus] {
+            cx.update(|window, cx| focus.focus(window, cx));
+            switch_away_and_back(cx, focus);
+        }
+        cx.update(|window, cx| search_focus.focus(window, cx));
+        switch_away_and_back(cx, &root_focus);
+
+        let diff_focus = split_editor.read_with(cx, |editor, cx| {
+            gpui::Focusable::focus_handle(editor.rhs_editor(), cx)
+        });
+        cx.update(|window, cx| diff_focus.focus(window, cx));
+        graph.update_in(cx, |graph, window, cx| {
+            graph.deploy_header_context_menu(gpui::point(gpui::px(0.), gpui::px(0.)), window, cx);
+        });
+        cx.dispatch_action(menu::Cancel);
+        cx.update(|window, _| assert!(diff_focus.is_focused(window)));
+        switch_away_and_back(cx, &diff_focus);
+
+        cx.update(|_, cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new(
+                    "space space",
+                    workspace::SendKeystrokes("ctrl-tab Enter".into()),
+                    Some("GitGraph || Editor"),
+                ),
+                gpui::KeyBinding::new(
+                    "ctrl-tab",
+                    tab_switcher::Toggle::default(),
+                    Some("Workspace"),
+                ),
+                gpui::KeyBinding::new("enter", menu::Confirm, Some("TabSwitcher")),
+            ]);
+        });
+        cx.simulate_keystrokes("space space");
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.active_item_as::<editor::Editor>(cx),
+                Some(other.clone())
+            );
+        });
+        cx.simulate_keystrokes("space space");
+        cx.update(|window, _| assert!(diff_focus.is_focused(window)));
+
+        cx.dispatch_action(zed_actions::buffer_search::Deploy::find());
+        cx.update(|window, cx| root_focus.focus(window, cx));
+        cx.update(|window, cx| gpui::Focusable::focus_handle(&search_bar, cx).focus(window, cx));
+        switch_away_and_back(cx, &diff_focus);
+        cx.dispatch_action(search::buffer_search::Dismiss);
+        cx.refresh().expect("dismiss inline search");
+        assert!(cx.debug_bounds("buffer-search-bar").is_none());
+        cx.update(|window, _| assert!(diff_focus.is_focused(window)));
+
+        let item_count = workspace.read_with(cx, |workspace, cx| {
+            workspace.active_pane().read(cx).items_len()
+        });
+        let assert_graph_active = |cx: &mut gpui::VisualTestContext| {
+            cx.run_until_parked();
+            workspace.read_with(cx, |workspace, cx| {
+                assert_eq!(
+                    workspace.active_item_as::<super::GitGraphNext>(cx),
+                    Some(graph.clone())
+                );
+                assert_eq!(workspace.active_pane().read(cx).items_len(), item_count);
+            });
+        };
+        cx.update(|_, cx| {
+            cx.bind_keys(
+                settings::KeymapFile::load_asset_allow_partial_failure(
+                    "keymaps/default-windows.json",
+                    cx,
+                )
+                .expect("default keymap"),
+            );
+        });
+        cx.simulate_keystrokes("ctrl-f");
+        cx.simulate_input("secondneedle");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter shift-enter");
+        assert_graph_active(cx);
+        graph.update_in(cx, |graph, window, cx| {
+            assert!(graph.embedded_search_is_focused(window, cx));
+        });
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, _| assert!(diff_focus.is_focused(window)));
+
+        cx.update(|_, cx| {
+            gpui::BorrowAppContext::update_global(cx, |store: &mut settings::SettingsStore, cx| {
+                store.update_user_settings(cx, |settings| settings.vim_mode = Some(true));
+            });
+            for asset in ["keymaps/default-windows.json", "keymaps/vim.json"] {
+                cx.bind_keys(
+                    settings::KeymapFile::load_asset_allow_partial_failure(asset, cx)
+                        .expect("built-in keymap"),
+                );
+            }
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("/");
+        cx.run_until_parked();
+        graph.update_in(cx, |graph, window, cx| {
+            assert!(graph.embedded_search_is_focused(window, cx))
+        });
+        cx.simulate_input("secondneedle");
+        cx.run_until_parked();
+        assert!(search_bar.read_with(cx, |bar, _| bar.has_active_match()));
+        cx.simulate_keystrokes("enter");
+        assert_graph_active(cx);
+        cx.update(|window, _| assert!(diff_focus.is_focused(window)));
+        let first_match = split_editor.read_with(cx, |editor, cx| {
+            editor
+                .rhs_editor()
+                .read(cx)
+                .selections
+                .newest_anchor()
+                .head()
+        });
+        cx.simulate_keystrokes("n");
+        let second_match = split_editor.read_with(cx, |editor, cx| {
+            editor
+                .rhs_editor()
+                .read(cx)
+                .selections
+                .newest_anchor()
+                .head()
+        });
+        assert_ne!(first_match, second_match);
+        cx.simulate_keystrokes("shift-n");
+        assert_eq!(
+            first_match,
+            split_editor.read_with(cx, |editor, cx| editor
+                .rhs_editor()
+                .read(cx)
+                .selections
+                .newest_anchor()
+                .head())
+        );
+        cx.simulate_keystrokes("? enter");
+        assert_graph_active(cx);
+        cx.update(|window, _| assert!(diff_focus.is_focused(window)));
+        assert_eq!(
+            second_match,
+            split_editor.read_with(cx, |editor, cx| editor
+                .rhs_editor()
+                .read(cx)
+                .selections
+                .newest_anchor()
+                .head())
+        );
+
+        for split in [false, true] {
+            split_editor.update_in(cx, |editor, window, cx| {
+                if (editor.diff_view_style() == editor::DiffViewStyle::Split) != split {
+                    editor.toggle_split(&editor::ToggleSplitDiff, window, cx);
+                }
+            });
+            cx.refresh().expect("diff style for search submission");
+            for left in [false, true].into_iter().filter(|left| !left || split) {
+                let focus = split_editor.read_with(cx, |editor, cx| {
+                    gpui::Focusable::focus_handle(
+                        if left {
+                            editor.lhs_editor().expect("left editor")
+                        } else {
+                            editor.rhs_editor()
+                        },
+                        cx,
+                    )
+                });
+                cx.update(|window, cx| focus.focus(window, cx));
+                cx.simulate_keystrokes("/ enter");
+                assert_graph_active(cx);
+                cx.update(|window, _| assert!(focus.is_focused(window)));
+                cx.simulate_keystrokes("? enter");
+                assert_graph_active(cx);
+                cx.update(|window, _| assert!(focus.is_focused(window)));
+            }
+        }
+        cx.update(|window, cx| diff_focus.focus(window, cx));
+
+        let source = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .pane_for_item_id(graph.entity_id())
+                .expect("source pane")
+        });
+        let (destination, destination_search) = workspace.update_in(cx, |workspace, window, cx| {
+            let destination =
+                workspace.split_pane(source.clone(), workspace::SplitDirection::Right, window, cx);
+            let search =
+                gpui::AppContext::new(cx, |cx| search::BufferSearchBar::new(None, window, cx));
+            destination
+                .read(cx)
+                .toolbar()
+                .clone()
+                .update(cx, |toolbar, cx| {
+                    toolbar.add_item(search.clone(), window, cx)
+                });
+            (destination, search)
+        });
+        cx.update(|window, cx| {
+            workspace::move_item(
+                &source,
+                &destination,
+                graph.entity_id(),
+                0,
+                true,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(zed_actions::buffer_search::Deploy::find());
+        cx.run_until_parked();
+        assert!(!destination_search.read_with(cx, |bar, _| bar.is_dismissed()));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&other, true, true, window, cx);
+        });
+        cx.refresh().expect("graph in inactive pane");
+        graph.read_with(cx, |graph, _| {
+            assert_eq!(
+                graph
+                    .embedded_search_bar
+                    .as_ref()
+                    .expect("destination search")
+                    .0
+                    .entity_id(),
+                destination_search.entity_id()
+            );
+        });
+        cx.update(|window, cx| {
+            workspace::move_item(
+                &destination,
+                &source,
+                graph.entity_id(),
+                0,
+                true,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.refresh().expect("graph moved back");
+        graph.read_with(cx, |graph, _| {
+            assert_eq!(
+                graph
+                    .embedded_search_bar
+                    .as_ref()
+                    .expect("source search")
+                    .0
+                    .entity_id(),
+                search_bar.entity_id()
+            );
+        });
+
+        cx.dispatch_action(tab_switcher::Toggle::default());
+        cx.dispatch_action(menu::Confirm);
+        graph.update(cx, |graph, cx| graph.clear_diff(cx));
+        cx.dispatch_action(tab_switcher::Toggle::default());
+        cx.dispatch_action(menu::Confirm);
+        cx.update(|window, _| assert!(root_focus.is_focused(window)));
+    }
+
+    #[gpui::test]
+    async fn sticky_file_reveal_reserves_ancestor_rows(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            language_model::init(cx);
+            crate::init(cx);
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        let root = std::path::Path::new(util::path!("/project"));
+        let git_directory = root.join(".git");
+        fs.insert_tree(
+            root,
+            serde_json::json!({ ".git": {}, "root.rs": "content" }),
+        )
+        .await;
+        let sha = git::Oid::from_bytes(&[1; 20]).expect("commit SHA");
+        fs.set_graph_commits(
+            &git_directory,
+            vec![std::sync::Arc::new(
+                git::repository::InitialGraphCommitData {
+                    sha,
+                    parents: Default::default(),
+                    ref_names: vec!["HEAD -> main".into()],
+                },
+            )],
+        );
+        fs.set_commit_data(
+            &git_directory,
+            [(
+                git::repository::CommitData {
+                    sha,
+                    parents: Default::default(),
+                    author_name: "Author".into(),
+                    author_email: "author@example.com".into(),
+                    commit_timestamp: 1_700_000_000,
+                    subject: "Test sticky files".into(),
+                    message: "Test sticky files".into(),
+                },
+                false,
+            )],
+        );
+        let project = project::Project::test(fs, [root], cx).await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project.active_repository(cx).expect("repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        let graph = gpui::VisualContext::new_window_entity(cx, |window, cx| {
+            super::GitGraphNext::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                project.clone(),
+                workspace.downgrade(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        graph.update_in(cx, |graph, _, cx| {
+            graph.select_entry(0, gpui::ScrollStrategy::Top, cx)
+        });
+        cx.run_until_parked();
+        graph.update(cx, |graph, _| {
+            graph.selected_commit_files = (0..100)
+                .map(|index| changed_file(&format!("src/nested/{index:03}.rs")))
+                .chain([changed_file("src/root.rs")])
+                .collect();
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(graph.clone()), None, true, window, cx);
+        });
+        let draw = |cx: &mut gpui::VisualTestContext| {
+            cx.refresh().expect("refresh window");
+            cx.run_until_parked();
+        };
+        draw(cx);
+        let scroll = graph.read_with(cx, |graph, _| graph.changed_files_scroll_handle.clone());
+        let entry_count = graph.read_with(cx, |graph, _| {
+            super::build_changed_file_tree_entries(
+                graph.selected_commit_files.clone(),
+                &graph.changed_files_expanded_dirs,
+            )
+            .len()
+        });
+        let row_height = scroll
+            .0
+            .borrow()
+            .last_item_size
+            .expect("measured rows")
+            .contents
+            .height
+            / entry_count as f32;
+        // Place the target at the viewport top, where its two sticky ancestors would cover it.
+        ui::ScrollableHandle::set_offset(&scroll, gpui::point(gpui::px(0.), -row_height * 52.));
+        graph.update(cx, |graph, _| {
+            graph.selected_changed_file =
+                Some(git::repository::RepoPath::new("src/nested/050.rs").expect("path"));
+            graph.pending_reveal_changed_file.set(true);
+        });
+        draw(cx);
+        assert_eq!(ui::ScrollableHandle::offset(&scroll).y, -row_height * 50.);
+        let bounds = scroll.0.borrow().base_handle.bounds();
+        let sticky_position = gpui::point(bounds.center().x, bounds.top() + row_height / 2.);
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: sticky_position,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), -row_height * 2.)),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        draw(cx);
+        assert!(ui::ScrollableHandle::offset(&scroll).y < -row_height * 50.);
+        cx.simulate_click(sticky_position, Default::default());
+        draw(cx);
+        assert_eq!(ui::ScrollableHandle::offset(&scroll).y, gpui::px(0.));
+        graph.read_with(cx, |graph, _| {
+            assert!(graph.changed_files_expanded_dirs.is_empty());
+            assert_eq!(
+                graph
+                    .selected_changed_file
+                    .as_ref()
+                    .map(|path| path.as_unix_str()),
+                Some("src/nested/050.rs"),
+            );
+        });
+        graph.update(cx, |graph, _| {
+            graph.changed_files_view_mode = super::ChangedFilesViewMode::Flat;
+            graph.pending_reveal_changed_file.set(true);
+        });
+        ui::ScrollableHandle::set_offset(&scroll, gpui::point(gpui::px(0.), -row_height * 50.));
+        draw(cx);
+        assert_eq!(ui::ScrollableHandle::offset(&scroll).y, -row_height * 50.);
+        graph.update(cx, |graph, _| {
+            graph.changed_files_view_mode = super::ChangedFilesViewMode::Tree;
+            graph.selected_commit_files = vec![changed_file("other/file.rs")];
+        });
+        draw(cx);
+        assert_eq!(ui::ScrollableHandle::offset(&scroll).y, gpui::px(0.));
+    }
+
+    #[test]
+    fn directory_actions_include_hidden_descendants_but_not_sibling_prefixes() {
+        let directory = git::repository::RepoPath::new("src").expect("valid directory");
+        let nested = git::repository::RepoPath::new("src/nested/deep").expect("valid directory");
+        let sibling = git::repository::RepoPath::new("src-other").expect("valid directory");
+        let files = vec![
+            changed_file("src/z.rs"),
+            changed_file("src-other/other.rs"),
+            changed_file("src/nested/deep/a.rs"),
+            changed_file("root.rs"),
+        ];
+        let mut expanded_dirs = collections::HashMap::default();
+        expanded_dirs.insert(sibling.clone(), true);
+        super::set_changed_directory_expanded(&files, &mut expanded_dirs, &directory, false, true);
+        assert_eq!(expanded_dirs.get(&directory), Some(&false));
+        assert_eq!(expanded_dirs.get(&nested), Some(&false));
+        assert_eq!(expanded_dirs.get(&sibling), Some(&true));
+        assert_eq!(
+            super::changed_paths_in_directory(&files, &directory)
+                .iter()
+                .map(|path| path.as_unix_str())
+                .collect::<Vec<_>>(),
+            vec!["src/nested/deep/a.rs", "src/z.rs"],
+        );
+
+        super::set_changed_directory_expanded(&files, &mut expanded_dirs, &directory, true, false);
+        assert_eq!(expanded_dirs.get(&directory), Some(&true));
+        assert_eq!(expanded_dirs.get(&nested), Some(&false));
+        let collapsed_tree = super::build_changed_file_tree_entries(files.clone(), &expanded_dirs);
+        assert!(!collapsed_tree.iter().any(|entry| {
+            matches!(entry, super::ChangedFileTreeEntry::File(file)
+                if file.entry.repo_path.as_unix_str() == "src/nested/deep/a.rs")
+        }));
+
+        super::set_changed_directory_expanded(&files, &mut expanded_dirs, &directory, true, true);
+        assert_eq!(expanded_dirs.get(&nested), Some(&true));
+        let expanded_tree = super::build_changed_file_tree_entries(files, &expanded_dirs);
+        assert!(expanded_tree.iter().any(|entry| {
+            matches!(entry, super::ChangedFileTreeEntry::File(file)
+                if file.entry.repo_path.as_unix_str() == "src/nested/deep/a.rs")
+        }));
+    }
+
+    #[test]
+    fn file_history_selects_target_instead_of_first_changed_file() {
+        let target = git::repository::RepoPath::new("src/nested/target.rs").unwrap();
+        let other = git::repository::RepoPath::new("other.rs").unwrap();
+        let mut diff = project::git_store::CommitDiff {
+            files: vec![
+                project::git_store::CommitFile {
+                    path: other.clone(),
+                    old_text: None,
+                    new_text: Some("other".into()),
+                    is_binary: false,
+                },
+                project::git_store::CommitFile {
+                    path: target.clone(),
+                    old_text: Some("target".into()),
+                    new_text: None,
+                    is_binary: false,
+                },
+            ],
+            is_shallow_boundary: false,
+            history_path: None,
+        };
+        let source = git::repository::LogSource::Path(target.clone());
+        assert_eq!(
+            super::preferred_changed_file(&diff, &source),
+            Some(target.clone())
+        );
+        assert_eq!(
+            super::preferred_changed_file(&diff, &git::repository::LogSource::All),
+            Some(other),
+        );
+
+        let renamed = git::repository::RepoPath::new("old/target.rs").unwrap();
+        diff.files[1].path = renamed.clone();
+        assert_eq!(super::preferred_changed_file(&diff, &source), None);
+        diff.history_path = Some(renamed.clone());
+        assert_eq!(
+            super::preferred_changed_file(&diff, &source),
+            Some(renamed.clone())
+        );
+
+        diff.files[1].is_binary = true;
+        assert_eq!(super::preferred_changed_file(&diff, &source), Some(renamed));
+        diff.files.clear();
+        assert_eq!(super::preferred_changed_file(&diff, &source), None);
+    }
+
+    #[test]
+    fn split_ratios_restore_and_clamp() {
+        let mut graph_detail = super::GraphDetailSplitState::new();
+        assert_eq!(graph_detail.visible_top_ratio(), 0.25);
+        assert_eq!(graph_detail.bottom_ratio(), 0.75);
+
+        graph_detail.restore_ratio(0.95);
+        assert_eq!(graph_detail.visible_top_ratio(), 0.8);
+        graph_detail.on_double_click();
+        assert_eq!(graph_detail.visible_top_ratio(), 0.25);
+
+        let mut detail_content = super::DetailContentSplitState::new();
+        assert_eq!(detail_content.visible_left_ratio(), 0.2);
+        assert_eq!(detail_content.right_ratio(), 0.8);
+
+        detail_content.restore_ratio(0.05);
+        assert_eq!(detail_content.visible_left_ratio(), 0.15);
+        detail_content.on_double_click();
+        assert_eq!(detail_content.visible_left_ratio(), 0.2);
+    }
+}
