@@ -86,6 +86,7 @@ pub struct BufferSearchBar {
     configured_options: SearchOptions,
     query_error: Option<String>,
     dismissed: bool,
+    embedded: bool,
     search_history: SearchHistory,
     search_history_cursor: SearchHistoryCursor,
     replace_enabled: bool,
@@ -108,7 +109,7 @@ impl Render for BufferSearchBar {
             .and_then(|weak| weak.upgrade())
             .map(DiffStyleControls::new);
 
-        let collapse_expand_button = if self.needs_expand_collapse_option(cx) {
+        let collapse_expand_button = if !self.embedded && self.needs_expand_collapse_option(cx) {
             let query_editor_focus = self.query_editor.focus_handle(cx);
 
             let is_collapsed = self
@@ -220,8 +221,10 @@ impl Render for BufferSearchBar {
         let container_width = window.viewport_size().width;
         let input_width = SearchInputWidth::calc_width(container_width);
 
-        let input_base_styles =
-            |border_color| input_base_styles(border_color, |div| div.w(input_width));
+        let input_base_styles = |border_color| {
+            input_base_styles(border_color, |div| div.w(input_width))
+                .when(self.embedded, |div| div.w_auto().flex_1().min_w_0())
+        };
 
         let input_style = if find_in_results {
             filter_search_results_input(query_border, |div| div.w(input_width), cx)
@@ -239,21 +242,21 @@ impl Render for BufferSearchBar {
                 h_flex()
                     .flex_none()
                     .gap_1()
-                    .when(case, |div| {
+                    .when(case && !(self.embedded && narrow_mode), |div| {
                         div.child(SearchOption::CaseSensitive.as_button(
                             self.search_options,
                             SearchSource::Buffer,
                             focus_handle.clone(),
                         ))
                     })
-                    .when(word, |div| {
+                    .when(word && !(self.embedded && narrow_mode), |div| {
                         div.child(SearchOption::WholeWord.as_button(
                             self.search_options,
                             SearchSource::Buffer,
                             focus_handle.clone(),
                         ))
                     })
-                    .when(regex, |div| {
+                    .when(regex && !(self.embedded && narrow_mode), |div| {
                         div.child(SearchOption::Regex.as_button(
                             self.search_options,
                             SearchSource::Buffer,
@@ -265,6 +268,7 @@ impl Render for BufferSearchBar {
         let mode_column = h_flex()
             .gap_1()
             .min_w_64()
+            .when(self.embedded, |this| this.min_w_0().flex_none().gap_0p5())
             .when(replacement, |this| {
                 this.child(render_action_button(
                     "buffer-search-bar-toggle",
@@ -275,7 +279,7 @@ impl Render for BufferSearchBar {
                     focus_handle.clone(),
                 ))
             })
-            .when(selection, |this| {
+            .when(selection && !self.embedded, |this| {
                 this.child(
                     IconButton::new(
                         "buffer-search-bar-toggle-search-selection-button",
@@ -310,6 +314,7 @@ impl Render for BufferSearchBar {
                     .ml_2()
                     .border_l_1()
                     .border_color(theme_colors.border_variant)
+                    .when(self.embedded, |this| this.pl_0().ml_0().border_l_0())
                     .child(render_action_button(
                         "buffer-search-nav-button",
                         ui::IconName::ChevronLeft,
@@ -330,7 +335,7 @@ impl Render for BufferSearchBar {
                         &SelectNextMatch,
                         query_focus.clone(),
                     ))
-                    .when(!narrow_mode, |this| {
+                    .when(!narrow_mode || self.embedded, |this| {
                         this.child(div().ml_2().min_w(rems_from_px(40_f32)).child(
                             Label::new(match_text).size(LabelSize::Small).color(
                                 if self.active_match_index.is_some() {
@@ -342,7 +347,7 @@ impl Render for BufferSearchBar {
                         ))
                     });
 
-                el.when(select_all, |el| {
+                el.when(select_all && !self.embedded, |el| {
                     el.child(render_action_button(
                         "buffer-search-nav-button",
                         IconName::SelectAll,
@@ -354,7 +359,17 @@ impl Render for BufferSearchBar {
                 })
                 .child(matches_column)
             })
-            .when(find_in_results, |el| {
+            .when(self.embedded, |el| {
+                el.child(self.render_embedded_options(cx))
+            })
+            .when_some(self.query_error.clone().filter(|_| self.embedded), |el, error| {
+                el.child(
+                    IconButton::new("embedded-search-error", IconName::Warning)
+                        .icon_color(Color::Error)
+                        .tooltip(Tooltip::text(error)),
+                )
+            })
+            .when(find_in_results || self.embedded, |el| {
                 el.child(render_action_button(
                     "buffer-search",
                     IconName::Close,
@@ -370,6 +385,7 @@ impl Render for BufferSearchBar {
         let search_line = h_flex()
             .w_full()
             .gap_2()
+            .when(self.embedded, |this| this.min_w_0().gap_1())
             .when(find_in_results, |el| el.child(alignment_element()))
             .when(!find_in_results && has_collapse_button, |el| {
                 el.pl_0p5().child(collapse_expand_button.expect("button"))
@@ -431,8 +447,9 @@ impl Render for BufferSearchBar {
         let search_line =
             h_flex()
                 .relative()
+                .when(self.embedded, |this| this.w_full().min_w_0())
                 .child(search_line)
-                .when(!narrow_mode && !find_in_results, |this| {
+                .when(!narrow_mode && !find_in_results && !self.embedded, |this| {
                     this.child(
                         h_flex()
                             .absolute()
@@ -455,9 +472,11 @@ impl Render for BufferSearchBar {
 
         v_flex()
             .id("buffer_search")
+            .debug_selector(|| "buffer-search-bar".into())
             .gap_2()
             .w_full()
             .track_scroll(&self.scroll_handle)
+            .when(self.embedded, |this| this.min_w_0().gap_0())
             .key_context(key_context)
             .capture_action(cx.listener(Self::tab))
             .capture_action(cx.listener(Self::backtab))
@@ -501,7 +520,7 @@ impl Render for BufferSearchBar {
                 this.on_action(cx.listener(Self::toggle_selection))
             })
             .child(search_line)
-            .children(query_error_line)
+            .children(query_error_line.filter(|_| !self.embedded))
             .children(replace_line)
             .into_any_element()
     }
@@ -531,6 +550,17 @@ impl ToolbarItemView for BufferSearchBar {
         self.active_searchable_item.take();
         self.splittable_editor = None;
         self._splittable_editor_subscription = None;
+        let embedded = item.is_some_and(|item| item.embeds_buffer_search(cx));
+        if self.embedded != embedded {
+            self.embedded = embedded;
+            self.query_editor.update(cx, |editor, cx| {
+                editor.set_mode(editor::EditorMode::AutoHeight {
+                    min_lines: 1,
+                    max_lines: Some(if embedded { 1 } else { 4 }),
+                });
+                cx.notify();
+            });
+        }
 
         self.pending_search.take();
 
@@ -624,6 +654,58 @@ impl ToolbarItemView for BufferSearchBar {
 }
 
 impl BufferSearchBar {
+    fn render_embedded_options(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let focus_handle = self.focus_handle(cx);
+        let options = self.search_options;
+        let supported = self.supported_options(cx);
+        let selection_enabled = self.selection_search_enabled.is_some();
+        ui::PopoverMenu::new("embedded-search-options")
+            .menu(move |window, cx| {
+                Some(ui::ContextMenu::build(window, cx, |menu, _, _| {
+                    menu.context(focus_handle.clone())
+                        .when(supported.case, |menu| {
+                            menu.action_checked(
+                                "Case Sensitive",
+                                Box::new(ToggleCaseSensitive),
+                                options.contains(SearchOptions::CASE_SENSITIVE),
+                            )
+                        })
+                        .when(supported.word, |menu| {
+                            menu.action_checked(
+                                "Whole Word",
+                                Box::new(ToggleWholeWord),
+                                options.contains(SearchOptions::WHOLE_WORD),
+                            )
+                        })
+                        .when(supported.regex, |menu| {
+                            menu.action_checked(
+                                "Regular Expression",
+                                Box::new(ToggleRegex),
+                                options.contains(SearchOptions::REGEX),
+                            )
+                        })
+                        .when(supported.selection, |menu| {
+                            menu.action_checked(
+                                "Search in Selection",
+                                Box::new(ToggleSelection),
+                                selection_enabled,
+                            )
+                        })
+                        .when(supported.select_all, |menu| {
+                            menu.action("Select All Matches", Box::new(SelectAllMatches))
+                        })
+                        .separator()
+                        .action("Collapse/Expand File", Box::new(ToggleFoldAll))
+                        .action("Toggle Soft Wrap", Box::new(ToggleSoftWrap))
+                }))
+            })
+            .trigger_with_tooltip(
+                IconButton::new("embedded-search-options-trigger", IconName::Ellipsis)
+                    .icon_size(IconSize::Small),
+                Tooltip::text("Search Options"),
+            )
+    }
+
     pub fn query_editor_focused(&self) -> bool {
         self.query_editor_focused
     }
@@ -800,6 +882,7 @@ impl BufferSearchBar {
             pending_search: None,
             query_error: None,
             dismissed: true,
+            embedded: false,
             search_history: SearchHistory::new(
                 Some(MAX_BUFFER_SEARCH_HISTORY_SIZE),
                 project::search_history::QueryInsertionBehavior::ReplacePreviousIfContains,
@@ -878,7 +961,7 @@ impl BufferSearchBar {
             self.search_suggested(seed_query_override, window, cx);
             self.smartcase(window, cx);
             self.sync_select_next_case_sensitivity(cx);
-            self.replace_enabled |= deploy.replace_enabled;
+            self.replace_enabled |= deploy.replace_enabled && !self.embedded;
             self.selection_search_enabled =
                 self.selection_search_enabled
                     .or(if deploy.selection_search_enabled {
@@ -893,7 +976,7 @@ impl BufferSearchBar {
                 let has_seed_text = self
                     .query_suggestion(seed_query_override, window, cx)
                     .is_some();
-                if deploy.replace_enabled && has_seed_text {
+                if deploy.replace_enabled && !self.embedded && has_seed_text {
                     handle = self.replacement_editor.focus_handle(cx);
                     select_query = false;
                 };
@@ -967,10 +1050,15 @@ impl BufferSearchBar {
     }
 
     fn supported_options(&self, cx: &mut Context<Self>) -> workspace::searchable::SearchOptions {
-        self.active_searchable_item
+        let mut options = self
+            .active_searchable_item
             .as_ref()
             .map(|item| item.supported_options(cx))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if self.embedded {
+            options.replacement = false;
+        }
+        options
     }
 
     // We provide an expand/collapse button if we are in a multibuffer
@@ -1667,7 +1755,7 @@ impl BufferSearchBar {
     }
     fn cycle_field(&mut self, direction: Direction, window: &mut Window, cx: &mut Context<Self>) {
         let mut handles = vec![self.query_editor.focus_handle(cx)];
-        if self.replace_enabled {
+        if self.replace_enabled && !self.embedded {
             handles.push(self.replacement_editor.focus_handle(cx));
         }
         if let Some(item) = self.active_searchable_item.as_ref() {
