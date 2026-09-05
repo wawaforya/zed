@@ -2641,10 +2641,30 @@ impl GitPanel {
         };
         let entries = self.effective_status_entries();
         let allow_preview = allow_preview && entries.len() == 1;
+        let selected_section = self
+            .selected_entry
+            .and_then(|index| self.section_for_entry_index(index));
         for entry in entries {
-            SoloDiffView::open_or_focus(
+            let section = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, candidate)| {
+                    candidate
+                        .status_entry()
+                        .filter(|candidate| candidate.repo_path == entry.repo_path)
+                        .and_then(|_| self.section_for_entry_index(index))
+                })
+                .max_by_key(|section| Some(*section) == selected_section);
+            let target = match Self::diff_target_for_section(section) {
+                DiffTarget::Uncommitted => crate::solo_diff_view::SoloDiffTarget::Uncommitted,
+                DiffTarget::Staged => crate::solo_diff_view::SoloDiffTarget::Staged,
+                DiffTarget::Unstaged => crate::solo_diff_view::SoloDiffTarget::Unstaged,
+            };
+            SoloDiffView::open_or_focus_with_target(
                 entry,
                 repository.clone(),
+                target,
                 self.workspace.clone(),
                 allow_preview,
                 window,
