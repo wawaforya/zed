@@ -108,7 +108,12 @@ impl Toolbar {
 
 impl Render for Toolbar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.has_any_visible_items() {
+        if !self.has_any_visible_items()
+            || self
+                .active_item
+                .as_ref()
+                .is_some_and(|item| item.embeds_buffer_search(cx))
+        {
             return div();
         }
 
@@ -118,6 +123,7 @@ impl Render for Toolbar {
         let has_right_items = self.right_items().count() > 0;
 
         v_flex()
+            .debug_selector(|| "pane-toolbar".into())
             .group("toolbar")
             .relative()
             .py(DynamicSpacing::Base06.rems(cx))

@@ -1737,6 +1737,7 @@ mod tests {
                 })
                 .into(),
             is_shallow_boundary: false,
+            history_path: None,
         };
         let commit_view = workspace.update_in(cx, |workspace, window, cx| {
             let workspace_entity = cx.entity();
@@ -2018,6 +2019,7 @@ mod tests {
         let commit_diff = CommitDiff {
             files: vec![make_file("a.txt"), make_file("b.txt"), make_file("c.txt")],
             is_shallow_boundary: false,
+            history_path: None,
         };
 
         let commit_view = workspace.update_in(cx, |workspace, window, cx| {
