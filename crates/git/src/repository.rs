@@ -924,6 +924,31 @@ pub trait GitRepository: Send + Sync {
         ignore_shallow_boundary: bool,
         cx: AsyncApp,
     ) -> BoxFuture<'_, Result<CommitDiff>>;
+
+    fn load_commit_with_base(
+        &self,
+        commit: String,
+        base_commit: Option<String>,
+        ignore_shallow_boundary: bool,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>> {
+        if base_commit.is_some() {
+            return async {
+                anyhow::bail!("commit comparison is not supported by this repository")
+            }
+            .boxed();
+        }
+        self.load_commit(commit, ignore_shallow_boundary, cx)
+    }
+
+    fn file_history_path(
+        &self,
+        _commit: String,
+        _path: RepoPath,
+    ) -> BoxFuture<'_, Result<Option<RepoPath>>> {
+        async { Ok(None) }.boxed()
+    }
+
     fn blame(
         &self,
         path: RepoPath,
@@ -1451,10 +1476,21 @@ impl GitRepository for RealGitRepository {
         ignore_shallow_boundary: bool,
         cx: AsyncApp,
     ) -> BoxFuture<'_, Result<CommitDiff>> {
+        self.load_commit_with_base(commit, None, ignore_shallow_boundary, cx)
+    }
+
+    fn load_commit_with_base(
+        &self,
+        commit: String,
+        base_commit: Option<String>,
+        ignore_shallow_boundary: bool,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>> {
         let git = self.git_binary();
         let shallow_file_path = self.common_dir.join("shallow");
         cx.background_spawn(async move {
-            if !ignore_shallow_boundary
+            if base_commit.is_none()
+                && !ignore_shallow_boundary
                 && is_shallow_boundary_commit(&git, &shallow_file_path, &commit).await?
             {
                 return Ok(CommitDiff {
@@ -1463,8 +1499,14 @@ impl GitRepository for RealGitRepository {
                 });
             }
 
-            let show_output = git
-                .build_command(&[
+            let mut command = if let Some(base_commit) = base_commit {
+                let mut command = git.build_command(&[
+                    "diff", "-z", "--no-renames", "--raw", "--no-abbrev", "--no-ext-diff",
+                ]);
+                command.arg(base_commit);
+                command
+            } else {
+                git.build_command(&[
                     "show",
                     "--format=",
                     "-z",
@@ -1473,6 +1515,8 @@ impl GitRepository for RealGitRepository {
                     "--no-abbrev",
                     "--first-parent",
                 ])
+            };
+            let show_output = command
                 .arg(&commit)
                 .arg("--")
                 .stdin(Stdio::null())
@@ -1480,10 +1524,10 @@ impl GitRepository for RealGitRepository {
                 .stderr(Stdio::piped())
                 .output()
                 .await
-                .context("starting git show process")?;
+                .context("starting commit diff process")?;
             anyhow::ensure!(
                 show_output.status.success(),
-                "git show failed: {}",
+                "loading commit diff failed: {}",
                 String::from_utf8_lossy(&show_output.stderr)
             );
 
@@ -3372,6 +3416,35 @@ impl GitRepository for RealGitRepository {
         .boxed()
     }
 
+    fn file_history_path(
+        &self,
+        commit: String,
+        path: RepoPath,
+    ) -> BoxFuture<'_, Result<Option<RepoPath>>> {
+        let git = self.git_binary();
+        async move {
+            let commit = commit.parse::<Oid>()?;
+            let output = git
+                .run(&[
+                    "--literal-pathspecs",
+                    "log",
+                    "--follow",
+                    "--topo-order",
+                    "--format=%x00%H",
+                    "--name-status",
+                    "--no-ext-diff",
+                    "--no-show-signature",
+                    "--no-color",
+                    "-z",
+                    "--",
+                    path.as_unix_str(),
+                ])
+                .await?;
+            file_history_path_at_commit(&output, commit, &path)
+        }
+        .boxed()
+    }
+
     fn initial_graph_data(
         &self,
         log_source: LogSource,
@@ -3712,6 +3785,42 @@ fn parse_file_history_changed_files_output(
     }
 
     histories
+}
+
+fn file_history_path_at_commit(
+    output: &str,
+    commit: Oid,
+    path: &RepoPath,
+) -> Result<Option<RepoPath>> {
+    let mut fields = output.split('\0');
+    let mut current_commit = None;
+    let mut path = path.clone();
+    while let Some(field) = fields.next() {
+        if field.is_empty() {
+            let Some(sha) = fields.next().filter(|sha| !sha.is_empty()) else {
+                break;
+            };
+            current_commit = Some(sha.parse::<Oid>()?);
+            continue;
+        }
+        let status = field.trim_start_matches('\n');
+        let old_path = fields.next().context("missing file history path")?;
+        let renamed = status.starts_with('R') || status.starts_with('C');
+        let new_path = if renamed {
+            fields.next().context("missing renamed file history path")?
+        } else {
+            old_path
+        };
+        if new_path == path.as_unix_str() {
+            if current_commit == Some(commit) {
+                return Ok(Some(path));
+            }
+            if renamed {
+                path = RepoPath::new(old_path)?;
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn parse_initial_graph_output<'a>(
@@ -4634,6 +4743,133 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_load_commit_between_snapshots(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().expect("temporary repository");
+        let root = repo_dir.path();
+        git_init_repo(root);
+        fs::write(root.join("changed.txt"), "base\n").expect("base file");
+        fs::write(root.join("deleted.txt"), "deleted\n").expect("deleted file");
+        fs::write(root.join("reverted.txt"), "unchanged\n").expect("reverted file");
+        git_command(root, ["add", "."]);
+        git_command(root, ["commit", "-m", "base"]);
+        git_command(root, ["branch", "baseline"]);
+
+        fs::write(root.join("changed.txt"), "intermediate\n").expect("intermediate file");
+        fs::write(root.join("reverted.txt"), "temporary change\n").expect("temporary change");
+        fs::write(root.join("temporary.txt"), "temporary\n").expect("temporary file");
+        git_command(root, ["add", "."]);
+        git_command(root, ["commit", "-m", "intermediate"]);
+
+        fs::write(root.join("changed.txt"), "target\n").expect("target file");
+        fs::write(root.join("reverted.txt"), "unchanged\n").expect("revert change");
+        fs::write(root.join("added.txt"), "added\n").expect("added file");
+        fs::write(root.join("binary.bin"), b"\0binary\xff").expect("binary file");
+        fs::remove_file(root.join("deleted.txt")).expect("delete file");
+        fs::remove_file(root.join("temporary.txt")).expect("remove temporary file");
+        git_command(root, ["add", "."]);
+        git_command(root, ["commit", "-m", "target"]);
+        git_command(root, ["branch", "target"]);
+
+        let repository =
+            RealGitRepository::new(&root.join(".git"), None, Some("git".into()), cx.executor())
+                .expect("open repository");
+        let diff = repository
+            .load_commit_with_base(
+                "target".into(),
+                Some("baseline".into()),
+                false,
+                cx.to_async(),
+            )
+            .await
+            .expect("compare snapshots");
+        assert!(!diff.is_shallow_boundary);
+        assert_eq!(diff.files.len(), 4);
+        let changed = diff
+            .files
+            .iter()
+            .find(|file| file.path.as_unix_str() == "changed.txt")
+            .expect("changed file");
+        assert_eq!(changed.old_content.as_deref(), Some(b"base\n".as_slice()));
+        assert_eq!(changed.new_content.as_deref(), Some(b"target\n".as_slice()));
+        let added = diff
+            .files
+            .iter()
+            .find(|file| file.path.as_unix_str() == "added.txt")
+            .expect("added file");
+        assert_eq!(added.status(), CommitFileStatus::Added);
+        let deleted = diff
+            .files
+            .iter()
+            .find(|file| file.path.as_unix_str() == "deleted.txt")
+            .expect("deleted file");
+        assert_eq!(deleted.status(), CommitFileStatus::Deleted);
+        assert!(
+            diff.files
+                .iter()
+                .find(|file| file.path.as_unix_str() == "binary.bin")
+                .expect("binary file")
+                .is_binary
+        );
+
+        let reverse = repository
+            .load_commit_with_base(
+                "baseline".into(),
+                Some("target".into()),
+                false,
+                cx.to_async(),
+            )
+            .await
+            .expect("reverse comparison");
+        let changed = reverse
+            .files
+            .iter()
+            .find(|file| file.path.as_unix_str() == "changed.txt")
+            .expect("changed file");
+        assert_eq!(changed.old_content.as_deref(), Some(b"target\n".as_slice()));
+        assert_eq!(changed.new_content.as_deref(), Some(b"base\n".as_slice()));
+        assert!(repository.load_commit_with_base(
+            "target".into(), Some("target".into()), false, cx.to_async(),
+        ).await.expect("identical snapshots").files.is_empty());
+        assert!(
+            repository
+                .load_commit_with_base(
+                    "target".into(),
+                    Some("missing-commit".into()),
+                    false,
+                    cx.to_async(),
+                )
+                .await
+                .is_err()
+        );
+
+        git_command(root, ["checkout", "-b", "divergent", "baseline"]);
+        fs::write(root.join("changed.txt"), "other branch\n").expect("divergent file");
+        git_command(root, ["add", "."]);
+        git_command(root, ["commit", "-m", "divergent"]);
+        let divergent = repository
+            .load_commit_with_base(
+                "divergent".into(),
+                Some("target".into()),
+                false,
+                cx.to_async(),
+            )
+            .await
+            .expect("cross-branch comparison");
+        let changed = divergent
+            .files
+            .iter()
+            .find(|file| file.path.as_unix_str() == "changed.txt")
+            .expect("changed file");
+        assert_eq!(changed.old_content.as_deref(), Some(b"target\n".as_slice()));
+        assert_eq!(
+            changed.new_content.as_deref(),
+            Some(b"other branch\n".as_slice())
+        );
+    }
+
+    #[gpui::test]
     async fn test_load_commit_with_type_changed_file(cx: &mut TestAppContext) {
         disable_git_global_config();
         cx.executor().allow_parking();
@@ -5275,6 +5511,75 @@ mod tests {
                 SharedString::from("refs/remotes/origin/main"),
             ]
         );
+    }
+
+    #[test]
+    fn test_file_history_path_at_commit() {
+        let original = Oid::from_bytes(&[1; 20]).unwrap();
+        let renamed = Oid::from_bytes(&[2; 20]).unwrap();
+        let deleted = Oid::from_bytes(&[3; 20]).unwrap();
+        let current_path = RepoPath::new("new/name\nwith-tab\t.rs").unwrap();
+        let old_path = RepoPath::new("old/name.rs").unwrap();
+        let output = format!(
+            "\0{deleted}\0\nD\0{current}\0\0{renamed}\0\nR100\0{old}\0{current}\0\0{original}\0\nA\0{old}\0",
+            current = current_path.as_unix_str(),
+            old = old_path.as_unix_str(),
+        );
+        for commit in [deleted, renamed] {
+            assert_eq!(
+                file_history_path_at_commit(&output, commit, &current_path).unwrap(),
+                Some(current_path.clone()),
+            );
+        }
+        assert_eq!(
+            file_history_path_at_commit(&output, original, &current_path).unwrap(),
+            Some(old_path),
+        );
+        assert_eq!(
+            file_history_path_at_commit(&output, Oid::from_bytes(&[4; 20]).unwrap(), &current_path)
+                .unwrap(),
+            None,
+        );
+    }
+
+    #[gpui::test]
+    async fn test_file_history_path_follows_real_git_rename(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("old.txt"), "original contents\n").unwrap();
+        fs::write(repo_dir.path().join("other.txt"), "unrelated\n").unwrap();
+        git_command(repo_dir.path(), ["add", "."]);
+        git_command(repo_dir.path(), ["commit", "-m", "Initial commit"]);
+        let original = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+        git_command(repo_dir.path(), ["mv", "old.txt", "new.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "Rename file"]);
+        let renamed = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+        git_command(repo_dir.path(), ["rm", "new.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "Delete file"]);
+        let deleted = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+
+        let repo = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let path = RepoPath::new("new.txt").unwrap();
+        assert_eq!(
+            repo.file_history_path(original, path.clone())
+                .await
+                .unwrap(),
+            Some(RepoPath::new("old.txt").unwrap()),
+        );
+        for commit in [renamed, deleted] {
+            assert_eq!(
+                repo.file_history_path(commit, path.clone()).await.unwrap(),
+                Some(path.clone()),
+            );
+        }
     }
 
     #[gpui::test]
