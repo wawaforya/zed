@@ -51,6 +51,7 @@ rand.workspace = true
 release_channel.workspace = true
 remote_connection.workspace = true
 schemars.workspace = true
+search.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
@@ -89,9 +90,11 @@ rand.workspace = true
 remote_connection = { workspace = true, features = ["test-support"] }
 search.workspace = true
 settings = { workspace = true, features = ["test-support"] }
+tab_switcher.workspace = true
 task.workspace = true
 tree-sitter-md.workspace = true
 unindent.workspace = true
+vim.workspace = true
 workspace = { workspace = true, features = ["test-support"] }
 zlog.workspace = true
 

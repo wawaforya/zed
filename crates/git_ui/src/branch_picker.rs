@@ -133,6 +133,46 @@ pub fn select_popover(
     })
 }
 
+pub(crate) fn select_log_source_popover(
+    workspace: WeakEntity<Workspace>,
+    repository: Option<Entity<Repository>>,
+    selected_source: git::repository::LogSource,
+    on_select: SelectLogSourceCallback,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<BranchList> {
+    let selected_branch = match &selected_source {
+        git::repository::LogSource::Branch(branch) => Some(branch.clone()),
+        _ => None,
+    };
+    let on_select_branch = on_select.clone();
+    let list = select_popover(
+        workspace,
+        repository,
+        selected_branch,
+        Arc::new(move |branch, window, cx| {
+            on_select_branch(
+                git::repository::LogSource::Branch(branch.ref_name),
+                window,
+                cx,
+            );
+        }),
+        window,
+        cx,
+    );
+    list.update(cx, |list, cx| {
+        list.picker.update(cx, |picker, cx| {
+            picker.delegate.selected_index =
+                usize::from(selected_source == git::repository::LogSource::All);
+            picker.delegate.log_source_selection = Some((selected_source, on_select));
+            picker.refresh(window, cx);
+        });
+    });
+    list
+}
+
+type SelectLogSourceCallback = Arc<dyn Fn(git::repository::LogSource, &mut Window, &mut App)>;
+
 pub fn select_modal(
     workspace: WeakEntity<Workspace>,
     repository: Option<Entity<Repository>>,
@@ -547,6 +587,10 @@ impl Render for BranchList {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Entry {
+    LogSource {
+        source: git::repository::LogSource,
+        label: SharedString,
+    },
     Branch {
         branch: Branch,
         positions: Vec<usize>,
@@ -573,6 +617,7 @@ impl Entry {
 
     fn name(&self) -> &str {
         match self {
+            Entry::LogSource { label, .. } => label.as_ref(),
             Entry::Branch { branch, .. } => branch.name(),
             Entry::NewUrl { url, .. } => url.as_str(),
             Entry::NewBranch { name, .. } => name.as_str(),
@@ -671,6 +716,7 @@ pub struct BranchListDelegate {
     branch_filter_menu_handle: PopoverMenuHandle<ContextMenu>,
     state: PickerState,
     branch_selection_behavior: BranchSelectionBehavior,
+    log_source_selection: Option<(git::repository::LogSource, SelectLogSourceCallback)>,
     focus_handle: FocusHandle,
     restore_selected_branch: Option<SharedString>,
     show_footer: bool,
@@ -1025,6 +1071,7 @@ impl BranchListDelegate {
             branch_filter_menu_handle: PopoverMenuHandle::default(),
             state: PickerState::List,
             branch_selection_behavior,
+            log_source_selection: None,
             focus_handle: cx.focus_handle(),
             restore_selected_branch,
             show_footer: false,
@@ -1480,7 +1527,7 @@ impl PickerDelegate for BranchListDelegate {
                 matches
             };
             picker
-                .update(cx, |picker, _| {
+                .update(cx, |picker, cx| {
                     if let PickerState::CreateRemote(url) = &picker.delegate.state {
                         let query = normalize_branch_name(&query);
                         if !query.is_empty() {
@@ -1524,6 +1571,30 @@ impl PickerDelegate for BranchListDelegate {
                         picker.delegate.state = PickerState::List;
                     }
                     let delegate = &mut picker.delegate;
+                    if delegate.log_source_selection.is_some() {
+                        let current_label = delegate
+                            .repo
+                            .as_ref()
+                            .and_then(|repo| {
+                                repo.read(cx)
+                                    .branch
+                                    .as_ref()
+                                    .map(|branch| format!("Current · {}", branch.name()))
+                            })
+                            .unwrap_or_else(|| "Current · HEAD".to_string());
+                        let query = query.to_lowercase();
+                        let pinned = [
+                            (git::repository::LogSource::Branch("HEAD".into()), current_label),
+                            (git::repository::LogSource::All, "All Branches".to_string()),
+                        ]
+                        .into_iter()
+                        .filter(|(_, label)| label.to_lowercase().contains(&query))
+                        .map(|(source, label)| Entry::LogSource {
+                            source,
+                            label: label.into(),
+                        });
+                        matches.splice(0..0, pinned);
+                    }
                     delegate.matches = matches;
                     if delegate.matches.is_empty() {
                         delegate.selected_index = 0;
@@ -1554,6 +1625,11 @@ impl PickerDelegate for BranchListDelegate {
         };
 
         match entry {
+            Entry::LogSource { source, .. } => {
+                if let Some((_, on_select)) = &self.log_source_selection {
+                    on_select(source.clone(), window, cx);
+                }
+            }
             Entry::Branch { branch, .. } => {
                 if let BranchSelectionBehavior::Select { on_select, .. } =
                     &self.branch_selection_behavior
@@ -1684,6 +1760,17 @@ impl PickerDelegate for BranchListDelegate {
         });
 
         let entry_icon = match entry {
+            Entry::LogSource { source, .. } => {
+                if self
+                    .log_source_selection
+                    .as_ref()
+                    .is_some_and(|(selected, _)| selected == source)
+                {
+                    IconName::Check
+                } else {
+                    IconName::GitBranch
+                }
+            }
             Entry::NewUrl { .. } | Entry::NewBranch { .. } | Entry::NewRemoteName { .. } => {
                 IconName::Plus
             }
@@ -1703,6 +1790,10 @@ impl PickerDelegate for BranchListDelegate {
         };
 
         let entry_title = match entry {
+            Entry::LogSource { label, .. } => Label::new(label.clone())
+                .single_line()
+                .truncate()
+                .into_any_element(),
             Entry::NewUrl { .. } => Label::new("Create Remote Repository")
                 .single_line()
                 .truncate()
@@ -1832,6 +1923,13 @@ impl PickerDelegate for BranchListDelegate {
                                             format!("Based off {}", current_branch)
                                         } else {
                                             "Based off the current branch".to_string()
+                                        }
+                                    }
+                                    Entry::LogSource { source, .. } => {
+                                        if *source == git::repository::LogSource::All {
+                                            "Show commits from all branches".to_string()
+                                        } else {
+                                            "Follow the checked-out branch".to_string()
                                         }
                                     }
                                     Entry::Branch { .. } => String::new(),
@@ -2317,6 +2415,81 @@ mod tests {
                     .position(|name| *name == "fork/main"),
             "branches on the active branch's remote should be prioritized within their section"
         );
+    }
+
+    #[gpui::test]
+    async fn test_log_source_picker_pins_current_and_all(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (fs, project, repository) = init_fake_repository_with_fs(cx).await;
+        fs.set_branch_name(path!("/dir/.git").as_ref(), Some("main"));
+        cx.run_until_parked();
+        repository.update(cx, |repository, cx| {
+            repository.set_branch_list_for_test(create_test_branches(), cx);
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            MultiWorkspace::test_new(project, window, cx)
+        });
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        for (source, expected_index) in [
+            (git::repository::LogSource::Branch("HEAD".into()), 0),
+            (git::repository::LogSource::All, 1),
+            (git::repository::LogSource::Branch("refs/heads/main".into()), 2),
+        ] {
+            let selected = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let list = workspace.update_in(cx, |_, window, cx| {
+                select_log_source_popover(
+                    workspace.downgrade(),
+                    Some(repository.clone()),
+                    source.clone(),
+                    Arc::new({
+                        let selected = selected.clone();
+                        move |source, _, _| *selected.borrow_mut() = Some(source)
+                    }),
+                    window,
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            list.update_in(cx, |list, window, cx| {
+                list.picker.update(cx, |picker, cx| {
+                    assert_eq!(
+                        picker.delegate.matches.first().expect("current").name(),
+                        "Current · main"
+                    );
+                    assert_eq!(
+                        picker.delegate.matches.get(1).expect("all").name(),
+                        "All Branches"
+                    );
+                    assert_eq!(picker.delegate.selected_index, expected_index);
+                    picker.delegate.confirm(false, window, cx);
+                });
+            });
+            assert_eq!(*selected.borrow(), Some(source));
+            for (query, expected) in [
+                ("current", git::repository::LogSource::Branch("HEAD".into())),
+                ("all", git::repository::LogSource::All),
+            ] {
+                list.update_in(cx, |list, window, cx| {
+                    list.picker.update(cx, |picker, cx| {
+                        picker.delegate.update_matches(query.into(), window, cx)
+                    })
+                })
+                .await;
+                list.update_in(cx, |list, window, cx| {
+                    list.picker.update(cx, |picker, cx| {
+                        assert_eq!(picker.delegate.matches.len(), 1);
+                        picker.delegate.confirm(false, window, cx);
+                    });
+                });
+                assert_eq!(*selected.borrow(), Some(expected));
+            }
+        }
+        repository.read_with(cx, |repository, _| {
+            assert_eq!(
+                repository.branch.as_ref().expect("current branch").name(),
+                "main"
+            );
+        });
     }
 
     async fn init_branch_list_test(
