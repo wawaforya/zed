@@ -2426,14 +2426,21 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) {
         maybe!({
+            let selected_index = self.selected_entry?;
             let entry = self
                 .entries
-                .get(self.selected_entry?)?
+                .get(selected_index)?
                 .status_entry()?
                 .clone();
             let repository = self.active_repository.clone()?;
+            let target =
+                match Self::diff_target_for_section(self.section_for_entry_index(selected_index)) {
+                    DiffTarget::Uncommitted => crate::solo_diff_view::SoloDiffTarget::Uncommitted,
+                    DiffTarget::Staged => crate::solo_diff_view::SoloDiffTarget::Staged,
+                    DiffTarget::Unstaged => crate::solo_diff_view::SoloDiffTarget::Unstaged,
+                };
 
-            SoloDiffView::open_or_focus(entry, repository, self.workspace.clone(), allow_preview, window, cx)
+            SoloDiffView::open_or_focus_with_target(entry, repository, target, self.workspace.clone(), allow_preview, window, cx)
                 .detach_and_notify_err(self.workspace.clone(), window, cx);
 
             Some(())
