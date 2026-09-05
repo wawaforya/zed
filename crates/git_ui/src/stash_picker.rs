@@ -42,6 +42,22 @@ pub fn open(
     })
 }
 
+pub(crate) fn open_for_viewing(
+    workspace: &mut Workspace,
+    repository: Entity<Repository>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let weak_workspace = workspace.weak_handle();
+    workspace.toggle_modal(window, cx, |window, cx| {
+        let list = StashList::new(Some(repository), weak_workspace, rems(34.), window, cx);
+        list.picker.update(cx, |picker, _| {
+            picker.delegate.show_on_confirm = true;
+        });
+        list
+    });
+}
+
 pub fn create_embedded(
     repository: Option<Entity<Repository>>,
     workspace: WeakEntity<Workspace>,
@@ -244,6 +260,7 @@ pub struct StashListDelegate {
     focus_handle: FocusHandle,
     timezone: UtcOffset,
     show_footer: bool,
+    show_on_confirm: bool,
 }
 
 impl StashListDelegate {
@@ -266,6 +283,7 @@ impl StashListDelegate {
             focus_handle: cx.focus_handle(),
             timezone,
             show_footer: false,
+            show_on_confirm: false,
         }
     }
 
@@ -485,6 +503,9 @@ impl PickerDelegate for StashListDelegate {
         let stash_index = entry_match.entry.index;
         if secondary {
             self.pop_stash(stash_index, window, cx);
+        } else if self.show_on_confirm {
+            self.show_stash_at(self.selected_index(), window, cx);
+            cx.emit(DismissEvent);
         } else {
             self.apply_stash(stash_index, window, cx);
         }
@@ -660,7 +681,11 @@ impl PickerDelegate for StashListDelegate {
                     Button::new("view-stash", "View")
                         .key_binding(
                             KeyBinding::for_action_in(
-                                &stash_picker::ShowStashItem,
+                                if self.show_on_confirm {
+                                    &menu::Confirm as &dyn gpui::Action
+                                } else {
+                                    &stash_picker::ShowStashItem
+                                },
                                 &focus_handle,
                                 cx,
                             )
@@ -684,13 +709,21 @@ impl PickerDelegate for StashListDelegate {
                 )
                 .child(
                     Button::new("apply-stash", "Apply")
-                        .key_binding(
-                            KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
-                                .map(|kb| kb.size(rems_from_px(12_f32))),
-                        )
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(menu::Confirm.boxed_clone(), cx)
-                        }),
+                        .when(!self.show_on_confirm, |button| {
+                            button.key_binding(
+                                KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
+                                    .map(|kb| kb.size(rems_from_px(12_f32))),
+                            )
+                        })
+                        .on_click(cx.listener(|picker, _, window, cx| {
+                            if let Some(entry) = picker
+                                .delegate
+                                .matches
+                                .get(picker.delegate.selected_index())
+                            {
+                                picker.delegate.apply_stash(entry.entry.index, window, cx);
+                            }
+                        })),
                 )
                 .into_any(),
         )
@@ -731,6 +764,51 @@ mod tests {
             branch: branch.map(Into::into),
             timestamp: 1000 - index as i64,
         }
+    }
+
+    #[gpui::test]
+    async fn test_viewing_stashes_confirms_without_applying(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let root = std::path::Path::new(util::path!("/project"));
+        fs.insert_tree(root, serde_json::json!({".git": {}})).await;
+        let project = Project::test(fs, [root], cx).await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project.active_repository(cx).expect("repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            MultiWorkspace::test_new(project, window, cx)
+        });
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        let list = workspace.update_in(cx, |workspace, window, cx| {
+            super::open_for_viewing(workspace, repository.clone(), window, cx);
+            workspace.active_modal::<StashList>(cx).expect("stash picker")
+        });
+        cx.run_until_parked();
+        list.update_in(cx, |list, window, cx| {
+            list.picker.update(cx, |picker, cx| {
+                assert_eq!(picker.delegate.repo.as_ref(), Some(&repository));
+                assert!(picker.delegate.show_on_confirm);
+                picker.delegate.all_stash_entries =
+                    Some(vec![stash_entry(1, "saved changes", Some("main"))]);
+                picker.delegate.update_matches(String::new(), window, cx)
+            })
+        })
+        .await;
+        list.update_in(cx, |list, window, cx| {
+            list.picker.update(cx, |picker, cx| {
+                picker.delegate.confirm(false, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.active_modal::<StashList>(cx).is_none());
+            assert_eq!(
+                workspace.items_of_type::<crate::commit_view::CommitView>(cx).count(),
+                1
+            );
+        });
     }
 
     #[gpui::test]
