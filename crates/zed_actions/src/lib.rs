@@ -378,6 +378,16 @@ pub mod git {
     );
 }
 
+pub mod git_graph_next {
+    gpui::actions!(
+        git_graph_next,
+        [
+            /// Opens the Git Graph Next tab.
+            Open
+        ]
+    );
+}
+
 pub mod toast {
     use gpui::actions;
 
