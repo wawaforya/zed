@@ -924,6 +924,15 @@ pub trait GitRepository: Send + Sync {
         ignore_shallow_boundary: bool,
         cx: AsyncApp,
     ) -> BoxFuture<'_, Result<CommitDiff>>;
+
+    fn file_history_path(
+        &self,
+        _commit: String,
+        _path: RepoPath,
+    ) -> BoxFuture<'_, Result<Option<RepoPath>>> {
+        async { Ok(None) }.boxed()
+    }
+
     fn blame(
         &self,
         path: RepoPath,
@@ -3372,6 +3381,35 @@ impl GitRepository for RealGitRepository {
         .boxed()
     }
 
+    fn file_history_path(
+        &self,
+        commit: String,
+        path: RepoPath,
+    ) -> BoxFuture<'_, Result<Option<RepoPath>>> {
+        let git = self.git_binary();
+        async move {
+            let commit = commit.parse::<Oid>()?;
+            let output = git
+                .run(&[
+                    "--literal-pathspecs",
+                    "log",
+                    "--follow",
+                    "--topo-order",
+                    "--format=%x00%H",
+                    "--name-status",
+                    "--no-ext-diff",
+                    "--no-show-signature",
+                    "--no-color",
+                    "-z",
+                    "--",
+                    path.as_unix_str(),
+                ])
+                .await?;
+            file_history_path_at_commit(&output, commit, &path)
+        }
+        .boxed()
+    }
+
     fn initial_graph_data(
         &self,
         log_source: LogSource,
@@ -3712,6 +3750,42 @@ fn parse_file_history_changed_files_output(
     }
 
     histories
+}
+
+fn file_history_path_at_commit(
+    output: &str,
+    commit: Oid,
+    path: &RepoPath,
+) -> Result<Option<RepoPath>> {
+    let mut fields = output.split('\0');
+    let mut current_commit = None;
+    let mut path = path.clone();
+    while let Some(field) = fields.next() {
+        if field.is_empty() {
+            let Some(sha) = fields.next().filter(|sha| !sha.is_empty()) else {
+                break;
+            };
+            current_commit = Some(sha.parse::<Oid>()?);
+            continue;
+        }
+        let status = field.trim_start_matches('\n');
+        let old_path = fields.next().context("missing file history path")?;
+        let renamed = status.starts_with('R') || status.starts_with('C');
+        let new_path = if renamed {
+            fields.next().context("missing renamed file history path")?
+        } else {
+            old_path
+        };
+        if new_path == path.as_unix_str() {
+            if current_commit == Some(commit) {
+                return Ok(Some(path));
+            }
+            if renamed {
+                path = RepoPath::new(old_path)?;
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn parse_initial_graph_output<'a>(
@@ -5275,6 +5349,75 @@ mod tests {
                 SharedString::from("refs/remotes/origin/main"),
             ]
         );
+    }
+
+    #[test]
+    fn test_file_history_path_at_commit() {
+        let original = Oid::from_bytes(&[1; 20]).unwrap();
+        let renamed = Oid::from_bytes(&[2; 20]).unwrap();
+        let deleted = Oid::from_bytes(&[3; 20]).unwrap();
+        let current_path = RepoPath::new("new/name\nwith-tab\t.rs").unwrap();
+        let old_path = RepoPath::new("old/name.rs").unwrap();
+        let output = format!(
+            "\0{deleted}\0\nD\0{current}\0\0{renamed}\0\nR100\0{old}\0{current}\0\0{original}\0\nA\0{old}\0",
+            current = current_path.as_unix_str(),
+            old = old_path.as_unix_str(),
+        );
+        for commit in [deleted, renamed] {
+            assert_eq!(
+                file_history_path_at_commit(&output, commit, &current_path).unwrap(),
+                Some(current_path.clone()),
+            );
+        }
+        assert_eq!(
+            file_history_path_at_commit(&output, original, &current_path).unwrap(),
+            Some(old_path),
+        );
+        assert_eq!(
+            file_history_path_at_commit(&output, Oid::from_bytes(&[4; 20]).unwrap(), &current_path)
+                .unwrap(),
+            None,
+        );
+    }
+
+    #[gpui::test]
+    async fn test_file_history_path_follows_real_git_rename(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("old.txt"), "original contents\n").unwrap();
+        fs::write(repo_dir.path().join("other.txt"), "unrelated\n").unwrap();
+        git_command(repo_dir.path(), ["add", "."]);
+        git_command(repo_dir.path(), ["commit", "-m", "Initial commit"]);
+        let original = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+        git_command(repo_dir.path(), ["mv", "old.txt", "new.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "Rename file"]);
+        let renamed = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+        git_command(repo_dir.path(), ["rm", "new.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "Delete file"]);
+        let deleted = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+
+        let repo = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let path = RepoPath::new("new.txt").unwrap();
+        assert_eq!(
+            repo.file_history_path(original, path.clone())
+                .await
+                .unwrap(),
+            Some(RepoPath::new("old.txt").unwrap()),
+        );
+        for commit in [renamed, deleted] {
+            assert_eq!(
+                repo.file_history_path(commit, path.clone()).await.unwrap(),
+                Some(path.clone()),
+            );
+        }
     }
 
     #[gpui::test]

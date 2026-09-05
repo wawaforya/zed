@@ -306,13 +306,16 @@ impl Render for TitleBar {
             }
         }
 
+        let show_git_controls = repository.is_some() && is_git_enabled;
+
         children.push(
             h_flex()
                 .h_full()
                 .gap_0p5()
                 .map(|title_bar| {
                     let mut render_project_items = title_bar_settings.show_branch_name
-                        || title_bar_settings.show_project_items;
+                        || title_bar_settings.show_project_items
+                        || show_git_controls;
                     title_bar
                         .when_some(
                             self.application_menu.clone().filter(|_| !show_menus),
@@ -338,7 +341,7 @@ impl Render for TitleBar {
                                 .when_some(
                                     repository.filter(|_| is_git_enabled),
                                     |title_bar, repository| {
-                                        title_bar.children(self.render_worktree_and_branch(
+                                        title_bar.children(self.render_git_controls(
                                             repository,
                                             linked_worktree_name,
                                             cx,
@@ -926,7 +929,7 @@ impl TitleBar {
             .anchor(gpui::Anchor::TopLeft)
     }
 
-    fn render_worktree_and_branch(
+    fn render_git_controls(
         &self,
         repository: Entity<project::git_store::Repository>,
         linked_worktree_name: Option<SharedString>,
@@ -971,6 +974,22 @@ impl TitleBar {
             (branch_name, icon_info, is_detached_head)
         };
 
+        let head_commit = repository.read(cx).head_commit.clone();
+        let graph_label = head_commit
+            .as_ref()
+            .map(|commit| {
+                let short_sha = commit
+                    .sha
+                    .chars()
+                    .take(MAX_SHORT_SHA_LENGTH)
+                    .collect::<String>();
+                let subject = commit.message.lines().next().unwrap_or_default();
+                format!("{short_sha} {subject}")
+            })
+            .unwrap_or_else(|| "No commits".to_string());
+        let graph_tooltip = head_commit
+            .map(|commit| format!("{}\n{}", commit.sha, commit.message))
+            .unwrap_or_else(|| "No commits".to_string());
         let settings = TitleBarSettings::get_global(cx);
         let effective_repository = Some(repository);
 
@@ -1090,25 +1109,51 @@ impl TitleBar {
             })
         });
 
-        if worktree_button.is_none() && branch_picker.is_none() {
-            return None;
-        }
+        let show_branch_separator = worktree_button.is_some() && branch_picker.is_some();
+        let show_graph_separator = worktree_button.is_some() || branch_picker.is_some();
+        let separator = || {
+            Label::new("/")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .alpha(0.25)
+        };
 
-        let show_separator = worktree_button.is_some() && branch_picker.is_some();
+        let graph_button = Button::new("git_graph_next_trigger", graph_label)
+            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+            .label_size(LabelSize::Small)
+            .truncate(true)
+            .color(Color::Muted)
+            .tab_index(0isize)
+            .start_icon(
+                Icon::new(IconName::GitGraph)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .tooltip(move |_window, cx| {
+                Tooltip::with_meta(
+                    "Open Git Graph Next",
+                    Some(&zed_actions::git_graph_next::Open),
+                    graph_tooltip.clone(),
+                    cx,
+                )
+            })
+            .on_click(|_, window, cx| {
+                window.dispatch_action(zed_actions::git_graph_next::Open.boxed_clone(), cx)
+            });
 
         Some(
             h_flex()
                 .gap_px()
                 .children(worktree_button)
-                .when(show_separator, |this| {
-                    this.child(
-                        Label::new("/")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .alpha(0.25),
-                    )
-                })
+                .when(show_branch_separator, |this| this.child(separator()))
                 .children(branch_picker)
+                .when(show_graph_separator, |this| this.child(separator()))
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .max_w(rems(28.))
+                        .child(graph_button.full_width()),
+                )
                 .into_any_element(),
         )
     }

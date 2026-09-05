@@ -299,11 +299,13 @@ message LoadCommitDiff {
   uint64 repository_id = 3;
   string commit = 4;
   bool ignore_shallow_boundary = 5;
+  optional string history_path = 6;
 }
 
 message LoadCommitDiffResponse {
   repeated CommitFile files = 1;
   bool is_shallow_boundary = 2;
+  optional string history_path = 3;
 }
 
 message CommitFile {
