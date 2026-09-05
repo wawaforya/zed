@@ -1687,7 +1687,7 @@ impl GitRepository for FakeGitRepository {
 
     fn initial_graph_data(
         &self,
-        _log_source: LogSource,
+        log_source: LogSource,
         _log_order: LogOrder,
         request_tx: Sender<Vec<Arc<InitialGraphCommitData>>>,
     ) -> BoxFuture<'_, Result<()>> {
@@ -1697,7 +1697,21 @@ impl GitRepository for FakeGitRepository {
             let (graph_commits, simulated_error) =
                 fs.with_git_state(&dot_git_path, false, |state| {
                     (
-                        state.graph_commits.clone(),
+                        state
+                            .graph_commits
+                            .iter()
+                            .filter(|commit| {
+                                if !matches!(log_source, LogSource::Author { .. }) {
+                                    return true;
+                                }
+                                match state.commit_data.get(&commit.sha) {
+                                    Some(FakeCommitDataEntry::Success(data)) => log_source
+                                        .matches_author(&data.author_name, &data.author_email),
+                                    _ => false,
+                                }
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>(),
                         state.simulated_graph_error.clone(),
                     )
                 })?;
@@ -1716,7 +1730,7 @@ impl GitRepository for FakeGitRepository {
 
     fn search_commits(
         &self,
-        _log_source: LogSource,
+        log_source: LogSource,
         search_args: SearchCommitArgs,
         request_tx: Sender<Oid>,
     ) -> BoxFuture<'_, Result<()>> {
@@ -1737,6 +1751,12 @@ impl GitRepository for FakeGitRepository {
                         let FakeCommitDataEntry::Success(commit_data) = entry else {
                             return None;
                         };
+                        if !log_source.matches_author(
+                            &commit_data.author_name,
+                            &commit_data.author_email,
+                        ) {
+                            return None;
+                        }
                         if let Some(hash_query) = hash_query.as_ref() {
                             return sha
                                 .to_string()
