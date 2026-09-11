@@ -312,6 +312,7 @@ struct EntryDetails {
     is_private: bool,
     worktree_id: WorktreeId,
     canonical_path: Option<Arc<Path>>,
+    file_tooltip: Option<workspace::file_tooltip::FileTooltipDetails>,
 }
 
 /// The glyph a row's diagnostic mark decorates, and the shape of that mark.
@@ -6210,7 +6211,7 @@ impl ProjectPanel {
             .when_some(
                 tooltip_path.and_then(|path| {
                     let delay = match settings.title_tooltip_delay {
-                        settings::ProjectPanelTitleTooltipDelay::Default => 1500,
+                        settings::ProjectPanelTitleTooltipDelay::Default => 500,
                         settings::ProjectPanelTitleTooltipDelay::Custom(delay_ms) => delay_ms.0,
                         settings::ProjectPanelTitleTooltipDelay::Disabled => {
                             return None;
@@ -6219,8 +6220,21 @@ impl ProjectPanel {
                     Some((path, delay))
                 }),
                 |this, (path, delay)| {
-                    this.tooltip_show_delay(Duration::from_millis(delay))
-                        .tooltip(Tooltip::text(path))
+                    let this = this.tooltip_show_delay(Duration::from_millis(delay));
+                    if kind.is_file() {
+                        this.when_some(
+                            details
+                                .file_tooltip
+                                .filter(|_| !details.is_editing && !details.is_processing),
+                            |this, tooltip| {
+                                this.tooltip(Tooltip::element(move |_window, cx| {
+                                    workspace::file_tooltip::render_file_tooltip(&tooltip, cx)
+                                }))
+                            },
+                        )
+                    } else {
+                        this.tooltip(Tooltip::text(path))
+                    }
                 },
             )
             .cursor_pointer()
@@ -7186,6 +7200,18 @@ impl ProjectPanel {
             is_private: entry.is_private,
             worktree_id,
             canonical_path: entry.canonical_path.clone(),
+            file_tooltip: entry.kind.is_file().then(|| {
+                workspace::file_tooltip::FileTooltipDetails::new(
+                    Some(entry),
+                    if entry.path.is_empty() {
+                        root_name
+                    } else {
+                        entry.path.as_ref()
+                    },
+                    path_style,
+                    self.project.read(cx).languages(),
+                )
+            }),
         }
     }
 
