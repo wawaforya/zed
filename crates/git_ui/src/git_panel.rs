@@ -8995,6 +8995,30 @@ impl GitPanel {
             .hover(|s| s.bg(hover_bg))
             .active(|s| s.bg(active_bg))
             .child(name_row)
+            .tooltip_show_delay(Duration::from_millis(500))
+            .tooltip(Tooltip::element({
+                let project = self.project.clone();
+                let project_path = repo.repo_path_to_project_path(&entry.repo_path, cx);
+                let repo_path = entry.repo_path.clone();
+                move |_window, cx| {
+                    let project = project.read(cx);
+                    let entry = project_path
+                        .as_ref()
+                        .and_then(|path| project.entry_for_path(path, cx));
+                    let path = project_path
+                        .as_ref()
+                        .map(|path| path.path.as_ref())
+                        .filter(|path| !path.is_empty())
+                        .unwrap_or(&repo_path);
+                    let details = workspace::file_tooltip::FileTooltipDetails::new(
+                        entry,
+                        path,
+                        path_style,
+                        project.languages(),
+                    );
+                    workspace::file_tooltip::render_file_tooltip(&details, cx)
+                }
+            }))
             .when(GitPanelSettings::get_global(cx).diff_stats, |el| {
                 el.when_some(entry.diff_stat, move |this, stat| {
                     let id = format!("diff-stat-{}", id_for_diff_stat);
