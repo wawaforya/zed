@@ -14080,6 +14080,7 @@ name = "project_panel"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "client",
  "collections",
  "criterion",
@@ -14100,6 +14101,7 @@ dependencies = [
  "notifications",
  "pretty_assertions",
  "project",
+ "proto",
  "rayon",
  "schemars 1.0.4",
  "serde",
