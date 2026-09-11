@@ -310,6 +310,106 @@ struct EntryDetails {
     is_private: bool,
     worktree_id: WorktreeId,
     canonical_path: Option<Arc<Path>>,
+    file_tooltip: Option<FileTooltipDetails>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct FileTooltipDetails {
+    file_type: SharedString,
+    size: SharedString,
+    path: SharedString,
+    update: SharedString,
+}
+
+impl FileTooltipDetails {
+    fn new(
+        entry: &Entry,
+        root_name: &RelPath,
+        path_style: PathStyle,
+        languages: &Arc<language::LanguageRegistry>,
+    ) -> Self {
+        let path = if entry.path.is_empty() {
+            root_name
+        } else {
+            entry.path.as_ref()
+        };
+        let extension = path
+            .as_std_path()
+            .extension()
+            .and_then(|extension| extension.to_str());
+        let file_type = if entry.is_fifo {
+            SharedString::from("Named Pipe")
+        } else if let Some(language_name) =
+            languages.language_name_for_file_path(path.as_std_path())
+        {
+            match extension {
+                Some(extension) => format!("{language_name} (.{extension})").into(),
+                None => language_name.into(),
+            }
+        } else {
+            match extension {
+                Some(extension) => format!("{} File", extension.to_uppercase()).into(),
+                None => SharedString::from("File"),
+            }
+        };
+
+        Self {
+            file_type,
+            size: if entry.is_fifo {
+                "Unavailable".into()
+            } else {
+                util::size::format_file_size(entry.size, false).into()
+            },
+            path: path.display(path_style).to_string().into(),
+            update: entry
+                .mtime
+                .map(|mtime| {
+                    chrono::DateTime::<chrono::Local>::from(mtime.timestamp_for_user())
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                        .into()
+                })
+                .unwrap_or_else(|| "Unavailable".into()),
+        }
+    }
+}
+
+fn render_file_tooltip(details: &FileTooltipDetails, cx: &mut App) -> AnyElement {
+    v_flex()
+        .max_w_72()
+        .min_w_0()
+        .gap_0p5()
+        .children(
+            [
+                ("Type", details.file_type.clone()),
+                ("Size", details.size.clone()),
+                ("Path", details.path.clone()),
+                ("Update", details.update.clone()),
+            ]
+            .into_iter()
+            .map(|(label, value)| {
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(rems(3.5))
+                            .flex_none()
+                            .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .whitespace_normal()
+                            .child(Label::new(value).size(LabelSize::Small)),
+                    )
+            }),
+        )
+        .text_color(cx.theme().colors().text)
+        .into_any_element()
 }
 
 /// The glyph a row's diagnostic mark decorates, and the shape of that mark.
@@ -6073,8 +6173,21 @@ impl ProjectPanel {
                     Some((path, delay))
                 }),
                 |this, (path, delay)| {
-                    this.tooltip_show_delay(Duration::from_millis(delay))
-                        .tooltip(Tooltip::text(path))
+                    let this = this.tooltip_show_delay(Duration::from_millis(delay));
+                    if kind.is_file() {
+                        this.when_some(
+                            details
+                                .file_tooltip
+                                .filter(|_| !details.is_editing && !details.is_processing),
+                            |this, tooltip| {
+                                this.tooltip(Tooltip::element(move |_window, cx| {
+                                    render_file_tooltip(&tooltip, cx)
+                                }))
+                            },
+                        )
+                    } else {
+                        this.tooltip(Tooltip::text(path))
+                    }
                 },
             )
             .cursor_pointer()
@@ -7006,6 +7119,14 @@ impl ProjectPanel {
             is_private: entry.is_private,
             worktree_id,
             canonical_path: entry.canonical_path.clone(),
+            file_tooltip: entry.kind.is_file().then(|| {
+                FileTooltipDetails::new(
+                    entry,
+                    root_name,
+                    path_style,
+                    self.project.read(cx).languages(),
+                )
+            }),
         }
     }
 
