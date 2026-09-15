@@ -1,4 +1,5 @@
 pub(super) mod blame;
+pub(super) mod blame_diff;
 
 use super::*;
 use ::git::{
@@ -124,6 +125,9 @@ pub(super) enum DisplayDiffHunk {
 
 #[derive(Clone)]
 pub(super) struct InlineBlamePopoverState {
+    pub(super) buffer: BufferId,
+    pub(super) blame_entry: BlameEntry,
+    pub(super) diff: Entity<blame_diff::BlameDiff>,
     pub(super) scroll_handle: ScrollHandle,
     pub(super) commit_message: Option<ParsedCommitMessage>,
     pub(super) markdown: Entity<Markdown>,
@@ -135,6 +139,7 @@ pub(super) struct InlineBlamePopover {
     pub(super) popover_bounds: Option<Bounds<Pixels>>,
     pub(super) popover_state: InlineBlamePopoverState,
     pub(super) keyboard_grace: bool,
+    _diff_subscription: Subscription,
 }
 
 /// Represents a diff review button indicator that shows up when hovering over lines in the gutter
@@ -2024,11 +2029,31 @@ impl Editor {
                 editor
                     .update(cx, |editor, cx| {
                         editor.inline_blame_popover_show_task.take();
-                        let Some(blame) = editor.blame.as_ref() else {
+                        let Some(blame) = editor.blame.clone() else {
                             return;
                         };
-                        let blame = blame.read(cx);
-                        let details = blame.details_for_entry(buffer, &blame_entry);
+                        let snapshot = editor.display_snapshot(cx);
+                        let cursor = editor.selections.newest::<Point>(&snapshot).head();
+                        let historical_row = snapshot
+                            .buffer_snapshot()
+                            .point_to_buffer_point(cursor)
+                            .filter(|(current_buffer, _)| current_buffer.remote_id() == buffer)
+                            .and_then(|(_, point)| {
+                                blame.update(cx, |blame, cx| {
+                                    blame.historical_row_for_buffer_row(
+                                        buffer,
+                                        point.row,
+                                        &blame_entry,
+                                        cx,
+                                    )
+                                })
+                            });
+                        let repository = blame.read(cx).repository(cx, buffer);
+                        let details = blame.read(cx).details_for_entry(buffer, &blame_entry);
+                        let diff = cx.new(|cx| {
+                            blame_diff::BlameDiff::new(repository, &blame_entry, historical_row, cx)
+                        });
+                        let diff_subscription = cx.observe(&diff, |_, _, cx| cx.notify());
                         let markdown = cx.new(|cx| {
                             Markdown::new(
                                 details
@@ -2045,11 +2070,15 @@ impl Editor {
                             hide_task: None,
                             popover_bounds: None,
                             popover_state: InlineBlamePopoverState {
+                                buffer,
+                                blame_entry,
+                                diff,
                                 scroll_handle: ScrollHandle::new(),
                                 commit_message: details,
                                 markdown,
                             },
                             keyboard_grace: ignore_timeout,
+                            _diff_subscription: diff_subscription,
                         });
                         cx.notify();
                     })
