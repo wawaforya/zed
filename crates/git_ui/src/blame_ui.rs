@@ -34,6 +34,118 @@ const GIT_BLAME_AVATAR_SIZE: Rems = rems(1.);
 
 pub struct GitBlameRenderer;
 
+fn render_inline_blame_diff(
+    diff: &Entity<editor::BlameDiff>,
+    blame: &BlameEntry,
+    repository: Entity<Repository>,
+    workspace: WeakEntity<Workspace>,
+    window: &Window,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let diff = diff.read(cx);
+    v_flex()
+        .py_1p5()
+        .gap_1()
+        .border_t_1()
+        .border_color(cx.theme().colors().border_variant)
+        .child(
+            h_flex()
+                .justify_between()
+                .gap_2()
+                .child(
+                    Label::new(blame.filename.clone())
+                        .size(LabelSize::Small)
+                        .truncate(),
+                )
+                .child(
+                    Button::new("open-blame-file-diff", "View File Diff")
+                        .label_size(LabelSize::Small)
+                        .on_click({
+                            let sha = blame.sha.to_string();
+                            let path = RepoPath::new(&blame.filename).ok();
+                            move |_, window, cx| {
+                                cx.stop_propagation();
+                                CommitView::open(
+                                    sha.clone(),
+                                    repository.downgrade(),
+                                    workspace.clone(),
+                                    None,
+                                    path.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }),
+                ),
+        )
+        .child(match &diff.state {
+            editor::BlameDiffState::Loading => Label::new("Loading diff…")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element(),
+            editor::BlameDiffState::Unavailable(message) => Label::new(message.clone())
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element(),
+            editor::BlameDiffState::Ready(hunk) => v_flex()
+                .gap_1()
+                .child(
+                    Label::new(hunk.header.clone())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    v_flex()
+                        .id("inline-blame-diff")
+                        .items_start()
+                        .track_scroll(&diff.scroll_handle)
+                        .max_h(
+                            (window.line_height() * 12.).min(window.viewport_size().height * 0.4),
+                        )
+                        .overflow_scroll()
+                        .font_buffer(cx)
+                        .text_size(rems(0.75))
+                        .children(hunk.lines.iter().map(|line| {
+                            let old_row = line
+                                .old_row
+                                .map(|row| (row + 1).to_string())
+                                .unwrap_or_default();
+                            let new_row = line
+                                .new_row
+                                .map(|row| (row + 1).to_string())
+                                .unwrap_or_default();
+                            let marker = if line.is_current { '›' } else { ' ' };
+                            div()
+                                .flex_shrink_0()
+                                .min_w(gpui::relative(1.))
+                                .px_1()
+                                .whitespace_nowrap()
+                                .when(line.prefix == '-', |this| {
+                                    this.bg(cx.theme().colors().editor_diff_hunk_deleted_background)
+                                })
+                                .when(line.prefix == '+', |this| {
+                                    this.bg(cx.theme().colors().editor_diff_hunk_added_background)
+                                })
+                                .when(line.is_current, |this| {
+                                    this.text_color(cx.theme().colors().text_accent)
+                                })
+                                .child(format!(
+                                    "{marker} {old_row:>5} {new_row:>5} {} {}",
+                                    line.prefix, line.text
+                                ))
+                        })),
+                )
+                .when(hunk.truncated, |this| {
+                    this.child(
+                        Label::new("Preview truncated — open the file diff for all changes")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                })
+                .into_any_element(),
+        })
+}
+
 fn format_blame_text(blame_entry: &BlameEntry, cx: &App) -> String {
     let relative_timestamp = blame_entry_relative_timestamp(blame_entry);
     let author = blame_entry.author.as_deref().unwrap_or_default();
@@ -312,6 +424,7 @@ impl BlameRenderer for GitBlameRenderer {
         markdown: Entity<Markdown>,
         repository: Entity<Repository>,
         workspace: WeakEntity<Workspace>,
+        diff: Entity<editor::BlameDiff>,
         window: &mut Window,
         cx: &mut App,
     ) -> Option<AnyElement> {
@@ -408,6 +521,19 @@ impl BlameRenderer for GitBlameRenderer {
             .then(|| shallow_boundary_notice(repository.clone(), workspace.clone(), window, cx))
             .flatten();
 
+        let diff_preview = render_inline_blame_diff(
+            &diff,
+            &blame,
+            repository.clone(),
+            workspace.clone(),
+            window,
+            cx,
+        );
+        let popover_width = rems(42.)
+            .to_pixels(window.rem_size())
+            .min((window.viewport_size().width - px(32.)).max(px(1.)));
+        let popover_max_height = (window.viewport_size().height - px(32.)).max(px(1.));
+
         Some(
             tooltip_container(cx, |this, cx| {
                 this.occlude()
@@ -415,7 +541,10 @@ impl BlameRenderer for GitBlameRenderer {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         v_flex()
-                            .w(gpui::rems(30.))
+                            .id("inline-blame-popover-content")
+                            .w(popover_width)
+                            .max_h(popover_max_height)
+                            .overflow_y_scroll()
                             .child(
                                 h_flex()
                                     .pb_1()
@@ -444,6 +573,7 @@ impl BlameRenderer for GitBlameRenderer {
                                     .overflow_y_scroll()
                                     .child(message),
                             )
+                            .child(diff_preview)
                             .child(
                                 h_flex()
                                     .text_color(cx.theme().colors().text_muted)
