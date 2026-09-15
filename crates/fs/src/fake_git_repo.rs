@@ -318,6 +318,56 @@ impl GitRepository for FakeGitRepository {
         })
     }
 
+    fn recent_commits(
+        &self,
+        head: Oid,
+        offset: u64,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<Vec<git::repository::RecentCommit>>> {
+        self.with_state_async(false, move |state| {
+            anyhow::ensure!((1..=100).contains(&limit), "invalid commit page size");
+            if let Some(error) = &state.simulated_graph_error {
+                anyhow::bail!("{error}");
+            }
+            let mut reachable = HashSet::default();
+            let mut pending = vec![head];
+            while let Some(sha) = pending.pop() {
+                if reachable.insert(sha) {
+                    let commit = state
+                        .graph_commits
+                        .iter()
+                        .find(|commit| commit.sha == sha)
+                        .ok_or_else(|| anyhow::anyhow!("missing commit {sha}"))?;
+                    pending.extend(commit.parents.iter().copied());
+                }
+            }
+            state
+                .graph_commits
+                .iter()
+                .filter(|commit| reachable.contains(&commit.sha))
+                .skip(usize::try_from(offset)?)
+                .take(limit as usize)
+                .map(|commit| {
+                    let Some(FakeCommitDataEntry::Success(data)) =
+                        state.commit_data.get(&commit.sha)
+                    else {
+                        anyhow::bail!("missing commit data {}", commit.sha);
+                    };
+                    Ok(git::repository::RecentCommit {
+                        sha: data.sha,
+                        subject: data.subject.clone(),
+                        message: data.message.clone(),
+                        author_name: data.author_name.clone(),
+                        author_email: data.author_email.clone(),
+                        committer_name: data.author_name.clone(),
+                        committer_email: data.author_email.clone(),
+                        committer_timestamp: data.commit_timestamp,
+                    })
+                })
+                .collect()
+        })
+    }
+
     fn reset(
         &self,
         commit: String,

@@ -518,6 +518,44 @@ pub struct CommitSummary {
     pub has_parent: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecentCommit {
+    pub sha: Oid,
+    pub subject: SharedString,
+    pub message: SharedString,
+    pub author_name: SharedString,
+    pub author_email: SharedString,
+    pub committer_name: SharedString,
+    pub committer_email: SharedString,
+    pub committer_timestamp: i64,
+}
+
+fn parse_recent_commits(output: &str) -> Result<Vec<RecentCommit>> {
+    if output.is_empty() {
+        return Ok(Vec::new());
+    }
+    let output = output
+        .strip_suffix('\0')
+        .context("unterminated git log output")?;
+    let fields = output.split('\0').collect::<Vec<_>>();
+    anyhow::ensure!(fields.len() % 8 == 0, "invalid recent commits output");
+    fields
+        .chunks_exact(8)
+        .map(|fields| {
+            Ok(RecentCommit {
+                sha: fields[0].parse()?,
+                subject: fields[1].to_owned().into(),
+                message: fields[2].to_owned().into(),
+                author_name: fields[3].to_owned().into(),
+                author_email: fields[4].to_owned().into(),
+                committer_name: fields[5].to_owned().into(),
+                committer_email: fields[6].to_owned().into(),
+                committer_timestamp: fields[7].parse()?,
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub struct CommitDetails {
     pub sha: SharedString,
@@ -917,6 +955,13 @@ pub trait GitRepository: Send + Sync {
     ) -> BoxFuture<'_, Result<()>>;
 
     fn show(&self, commit: String) -> BoxFuture<'_, Result<CommitDetails>>;
+
+    fn recent_commits(
+        &self,
+        head: Oid,
+        offset: u64,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<Vec<RecentCommit>>>;
 
     fn load_commit(
         &self,
@@ -1441,6 +1486,34 @@ impl GitRepository for RealGitRepository {
                     author_email,
                     author_name,
                 })
+            })
+            .boxed()
+    }
+
+    fn recent_commits(
+        &self,
+        head: Oid,
+        offset: u64,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<Vec<RecentCommit>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                anyhow::ensure!((1..=100).contains(&limit), "invalid commit page size");
+                let output = git
+                    .run_raw(&[
+                        "log",
+                        "-z",
+                        "--date-order",
+                        "--no-show-signature",
+                        "--format=%H%x00%s%x00%B%x00%an%x00%ae%x00%cn%x00%ce%x00%ct",
+                        &format!("--skip={offset}"),
+                        &format!("--max-count={limit}"),
+                        &head.to_string(),
+                        "--",
+                    ])
+                    .await?;
+                parse_recent_commits(&output)
             })
             .boxed()
     }
@@ -5442,6 +5515,137 @@ mod tests {
 
         let details = repo.show("docs/rewrite".to_string()).await.unwrap();
         assert_eq!(details.sha.as_ref(), commit_sha.to_string());
+    }
+
+    #[test]
+    fn test_parse_recent_commits() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let record = format!(
+            "{sha}\0标题\0标题\n\n正文\n第二行\n\0Author\0author@example.com\0Committer\0committer@example.com\x001700000000\0"
+        );
+        let commits = parse_recent_commits(&record.repeat(2)).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].subject.as_ref(), "标题");
+        assert_eq!(commits[0].message.as_ref(), "标题\n\n正文\n第二行\n");
+        assert_eq!(commits[0].author_name.as_ref(), "Author");
+        assert_eq!(commits[0].committer_name.as_ref(), "Committer");
+        assert_eq!(commits[0].committer_timestamp, 1_700_000_000);
+        assert!(parse_recent_commits("").unwrap().is_empty());
+        assert!(parse_recent_commits("incomplete\0").is_err());
+        assert!(parse_recent_commits(record.trim_end_matches('\0')).is_err());
+        assert!(parse_recent_commits(&record.replace(sha, "invalid")).is_err());
+        assert!(parse_recent_commits(&record.replace("1700000000", "invalid")).is_err());
+    }
+
+    #[gpui::test]
+    async fn test_recent_commits_pagination(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        git_init_repo(path);
+        for index in 0..18 {
+            git_command(
+                path,
+                ["commit", "--allow-empty", "-m", &format!("Commit {index}")],
+            );
+        }
+        git_command(path, ["checkout", "-b", "side", "HEAD~5"]);
+        git_command(
+            path,
+            ["commit", "--allow-empty", "-m", "Merged side commit"],
+        );
+        let side_sha = git_command_output(path, ["rev-parse", "HEAD"]);
+        git_command(path, ["checkout", "main"]);
+        git_command(path, ["merge", "--no-ff", "side", "-m", "Merge side"]);
+        git_command(
+            path,
+            [
+                "commit",
+                "--allow-empty",
+                "--author=Author <author@example.com>",
+                "--date=2000-01-01T00:00:00+00:00",
+                "-m",
+                "标题\n\n多行正文\n第二行",
+            ],
+        );
+        let head: Oid = git_command_output(path, ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+        let expected = git_command_output(
+            path,
+            [
+                "log",
+                "--date-order",
+                "--format=%H",
+                &head.to_string(),
+                "--",
+            ],
+        )
+        .lines()
+        .map(|sha| sha.parse::<Oid>().unwrap())
+        .collect::<Vec<_>>();
+        let committed_at: i64 = git_command_output(path, ["show", "-s", "--format=%ct", "HEAD"])
+            .parse()
+            .unwrap();
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+        let first = repository.recent_commits(head, 0, 8).await.unwrap();
+        assert_eq!(first.len(), 8);
+        assert_eq!(first[0].sha, head);
+        assert_eq!(first[0].author_name.as_ref(), "Author");
+        assert_eq!(first[0].committer_name.as_ref(), "test");
+        assert_eq!(first[0].committer_email.as_ref(), "test@zed.dev");
+        assert_eq!(first[0].committer_timestamp, committed_at);
+        assert_ne!(first[0].committer_timestamp, 946684800);
+        assert_eq!(first[0].message.as_ref(), "标题\n\n多行正文\n第二行\n");
+
+        // New commits and a checkout must not shift pages anchored to the original HEAD.
+        git_command(path, ["commit", "--allow-empty", "-m", "New HEAD"]);
+        git_command(path, ["checkout", "-b", "unrelated", "HEAD~10"]);
+        git_command(
+            path,
+            [
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Not in the requested branch",
+            ],
+        );
+        let mut commits = first;
+        loop {
+            let page = repository
+                .recent_commits(head, commits.len() as u64, 8)
+                .await
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            assert!(page.len() <= 8);
+            commits.extend(page);
+        }
+        assert_eq!(
+            commits.iter().map(|commit| commit.sha).collect::<Vec<_>>(),
+            expected
+        );
+        assert!(
+            commits
+                .iter()
+                .any(|commit| commit.sha.to_string() == side_sha)
+        );
+        assert_eq!(
+            repository.recent_commits(head, 0, 1).await.unwrap().len(),
+            1
+        );
+        assert!(repository.recent_commits(head, 0, 0).await.is_err());
+        assert!(repository.recent_commits(head, 0, 101).await.is_err());
+        assert!(
+            repository
+                .recent_commits(Oid::from_bytes(&[0; 20]).unwrap(), 0, 8)
+                .await
+                .is_err()
+        );
     }
 
     #[test]
