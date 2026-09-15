@@ -113,6 +113,7 @@ pub use element::{
     file_status_label_color, render_breadcrumb_text,
 };
 pub use git::blame::{BlameRenderer, GitBlame};
+pub use git::blame_diff::{BlameDiff, BlameDiffState};
 pub use git::{
     DefaultDiffHunkRenderer, DiffHunkRenderer, HiddenDiffHunkRenderer,
     HiddenUnstagedDiffHunkRenderer, render_diff_hunk_controls, set_blame_renderer,
