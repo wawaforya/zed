@@ -30,6 +30,7 @@ use workspace::Workspace;
 pub struct GitBlameEntry {
     pub rows: u32,
     pub blame: Option<BlameEntry>,
+    source_row_offset: u32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -144,6 +145,7 @@ pub trait BlameRenderer {
         _: Entity<Markdown>,
         _: Entity<Repository>,
         _: WeakEntity<Workspace>,
+        _: Entity<crate::BlameDiff>,
         _: &mut Window,
         _: &mut App,
     ) -> Option<AnyElement>;
@@ -209,6 +211,7 @@ impl BlameRenderer for () {
         _: Entity<Markdown>,
         _: Entity<Repository>,
         _: WeakEntity<Workspace>,
+        _: Entity<crate::BlameDiff>,
         _: &mut Window,
         _: &mut App,
     ) -> Option<AnyElement> {
@@ -423,6 +426,27 @@ impl GitBlame {
         })
     }
 
+    pub(super) fn historical_row_for_buffer_row(
+        &mut self,
+        buffer_id: BufferId,
+        row: u32,
+        entry: &BlameEntry,
+        cx: &mut App,
+    ) -> Option<u32> {
+        self.sync(cx, buffer_id);
+        let mut cursor = self.buffers.get(&buffer_id)?.entries.cursor::<u32>(());
+        cursor.seek_forward(&row, Bias::Right);
+        let segment = cursor.item()?;
+        if segment.blame.as_ref()? != entry {
+            return None;
+        }
+        entry
+            .original_line_number
+            .checked_sub(1)?
+            .checked_add(segment.source_row_offset)?
+            .checked_add(row.checked_sub(*cursor.start())?)
+    }
+
     pub fn max_author_length(&mut self, cx: &mut App) -> usize {
         let mut max_author_length = 0;
         self.sync_all(cx);
@@ -544,6 +568,10 @@ impl GitBlame {
                     GitBlameEntry {
                         rows: edit.new.start - new_entries.summary().rows,
                         blame: cursor.item().and_then(|entry| entry.blame.clone()),
+                        source_row_offset: cursor.item().map_or(0, |entry| {
+                            entry.source_row_offset + edit.old.start - cursor.start()
+                                - (edit.new.start - new_entries.summary().rows)
+                        }),
                     },
                     (),
                 );
@@ -555,6 +583,7 @@ impl GitBlame {
                     GitBlameEntry {
                         rows: edit.new.len() as u32,
                         blame: None,
+                        source_row_offset: 0,
                     },
                     (),
                 );
@@ -571,6 +600,8 @@ impl GitBlame {
                         GitBlameEntry {
                             rows: cursor.end() - edit.old.end,
                             blame: entry.blame.clone(),
+                            // The suffix still refers to the original blame entry, not its first line.
+                            source_row_offset: entry.source_row_offset + edit.old.end - cursor.start(),
                         },
                         (),
                     );
@@ -831,11 +862,13 @@ fn build_blame_entry_sum_tree(entries: Vec<BlameEntry>, max_row: u32) -> SumTree
                 entries.push(GitBlameEntry {
                     rows: skipped_rows,
                     blame: None,
+                    source_row_offset: 0,
                 });
             }
             entries.push(GitBlameEntry {
                 rows: entry.range.len() as u32,
                 blame: Some(entry.clone()),
+                source_row_offset: 0,
             });
 
             current_row = entry.range.end;
@@ -849,6 +882,7 @@ fn build_blame_entry_sum_tree(entries: Vec<BlameEntry>, max_row: u32) -> SumTree
             GitBlameEntry {
                 rows: (max_row + 1) - current_row,
                 blame: None,
+                source_row_offset: 0,
             },
             (),
         );
@@ -1465,6 +1499,138 @@ mod tests {
                 cx,
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_blame_historical_rows_after_edits(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/my-repo"),
+            json!({
+                ".git": {}, "file.txt": "a\nb\nc\nd\ne\nf\n"
+            }),
+        )
+        .await;
+        let mut entry = blame_entry("1b1b1b", 0..6);
+        entry.original_line_number = 11;
+        fs.set_blame_for_repo(
+            Path::new(path!("/my-repo/.git")),
+            vec![(
+                repo_path("file.txt"),
+                Blame {
+                    entries: vec![entry.clone()],
+                    ..Default::default()
+                },
+            )],
+        );
+        let project = Project::test(fs, [path!("/my-repo").as_ref()], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/my-repo/file.txt"), cx)
+            })
+            .await
+            .unwrap();
+        let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer.clone(), cx));
+        let blame = cx.new(|cx| GitBlame::new(multi_buffer.clone(), project, false, true, cx));
+        cx.executor().run_until_parked();
+        let check = |expected: &[Option<u32>], cx: &mut gpui::TestAppContext| {
+            blame.update(cx, |blame, cx| {
+                for (row, expected) in expected.iter().enumerate() {
+                    assert_eq!(
+                        blame.historical_row_for_buffer_row(buffer_id, row as u32, &entry, cx),
+                        *expected,
+                        "row {row}"
+                    );
+                }
+            });
+        };
+        check(
+            &[Some(10), Some(11), Some(12), Some(13), Some(14), Some(15)],
+            cx,
+        );
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit(
+                [
+                    (Point::new(1, 0)..Point::new(1, 0), "first\n"),
+                    (Point::new(4, 0)..Point::new(4, 0), "second\n"),
+                ],
+                None,
+                cx,
+            );
+        });
+        check(
+            &[
+                Some(10),
+                None,
+                Some(11),
+                Some(12),
+                Some(13),
+                None,
+                Some(14),
+                Some(15),
+            ],
+            cx,
+        );
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit(
+                [
+                    (Point::new(1, 0)..Point::new(2, 0), ""),
+                    (Point::new(5, 0)..Point::new(6, 0), ""),
+                ],
+                None,
+                cx,
+            );
+        });
+        check(
+            &[Some(10), Some(11), Some(12), Some(13), Some(14), Some(15)],
+            cx,
+        );
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit(
+                [(Point::new(2, 0)..Point::new(2, 0), "inserted\n")],
+                None,
+                cx,
+            );
+        });
+        check(
+            &[
+                Some(10),
+                Some(11),
+                None,
+                Some(12),
+                Some(13),
+                Some(14),
+                Some(15),
+            ],
+            cx,
+        );
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(Point::new(4, 0)..Point::new(5, 0), "")], None, cx);
+        });
+        check(
+            &[Some(10), Some(11), None, Some(12), Some(14), Some(15)],
+            cx,
+        );
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(Point::new(3, 1)..Point::new(3, 1), "\n")], None, cx);
+        });
+        check(
+            &[Some(10), Some(11), None, Some(12), None, Some(14), Some(15)],
+            cx,
+        );
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit(
+                [
+                    (Point::new(1, 0)..Point::new(1, 0), "changed"),
+                    (Point::new(5, 0)..Point::new(5, 0), "changed"),
+                ],
+                None,
+                cx,
+            );
+        });
+        check(&[Some(10), None, None, Some(12), None, None, Some(15)], cx);
     }
 
     #[gpui::test(iterations = 100)]
