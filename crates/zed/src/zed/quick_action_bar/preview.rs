@@ -55,6 +55,12 @@ impl QuickActionBar {
             ),
         };
 
+        let split_tooltip = if matches!(&preview_target, PreviewTarget::Markdown(_)) {
+            "to toggle preview inside this tab"
+        } else {
+            "to open in a split"
+        };
+
         let alt_click = gpui::Keystroke {
             key: "click".into(),
             modifiers: Modifiers::alt(),
@@ -69,7 +75,7 @@ impl QuickActionBar {
                     tooltip_text,
                     Some(open_action_for_tooltip),
                     format!(
-                        "{} to open in a split",
+                        "{} {split_tooltip}",
                         text_for_keystroke(&alt_click.modifiers, &alt_click.key, cx)
                     ),
                     cx,
@@ -91,7 +97,7 @@ impl QuickActionBar {
                             PreviewTarget::Markdown(editor) => {
                                 let editor = editor.clone();
                                 if open_to_the_side {
-                                    MarkdownPreviewView::open_preview_to_the_side_of_pane(
+                                    MarkdownPreviewView::toggle_embedded_preview(
                                         workspace, editor, pane, window, cx,
                                     );
                                 } else {

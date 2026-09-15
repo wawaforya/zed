@@ -820,6 +820,10 @@ impl BufferSerialization {
 
 /// Addons allow storing per-editor state in other crates (e.g. Vim)
 pub trait Addon: 'static {
+    fn render_editor(&self, editor: AnyElement, _window: &mut Window, _cx: &App) -> AnyElement {
+        editor
+    }
+
     fn extend_key_context(&self, _: &mut KeyContext, _: &App) {}
 
     fn render_buffer_header_controls(
@@ -12544,8 +12548,12 @@ impl Focusable for Editor {
 }
 
 impl Render for Editor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        EditorElement::new(&cx.entity(), self.create_style(cx))
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut editor = EditorElement::new(&cx.entity(), self.create_style(cx)).into_any_element();
+        for addon in self.addons.values() {
+            editor = addon.render_editor(editor, window, cx);
+        }
+        editor
     }
 }
 
