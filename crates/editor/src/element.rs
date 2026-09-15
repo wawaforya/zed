@@ -2302,7 +2302,7 @@ impl EditorElement {
 
     fn layout_blame_popover(
         &self,
-        editor_snapshot: &EditorSnapshot,
+        _editor_snapshot: &EditorSnapshot,
         text_hitbox: &Hitbox,
         line_height: Pixels,
         window: &mut Window,
@@ -2315,33 +2315,6 @@ impl EditorElement {
         let Some(blame) = self.editor.read(cx).blame.clone() else {
             return;
         };
-        let cursor_point = self
-            .editor
-            .read(cx)
-            .selections
-            .newest::<language::Point>(&editor_snapshot.display_snapshot)
-            .head();
-
-        let Some((buffer, buffer_point)) = editor_snapshot
-            .buffer_snapshot()
-            .point_to_buffer_point(cursor_point)
-        else {
-            return;
-        };
-
-        let row_info = RowInfo {
-            buffer_id: Some(buffer.remote_id()),
-            buffer_row: Some(buffer_point.row),
-            ..Default::default()
-        };
-
-        let Some((buffer_id, blame_entry)) = blame
-            .update(cx, |blame, cx| blame.blame_for_rows(&[row_info], cx).next())
-            .flatten()
-        else {
-            return;
-        };
-
         let Some((popover_state, target_point)) = self.editor.read_with(cx, |editor, _| {
             editor
                 .inline_blame_popover
@@ -2357,13 +2330,14 @@ impl EditorElement {
 
         let maybe_element = workspace.and_then(|workspace| {
             render_blame_entry_popover(
-                blame_entry,
+                popover_state.blame_entry,
                 popover_state.scroll_handle,
                 popover_state.commit_message,
                 popover_state.markdown,
                 workspace,
                 &blame,
-                buffer_id,
+                popover_state.buffer,
+                popover_state.diff,
                 window,
                 cx,
             )
@@ -2386,7 +2360,14 @@ impl EditorElement {
                 - (popover_origin.x + size.width))
                 .min(Pixels::ZERO);
 
-            let origin = point(popover_origin.x + horizontal_offset, popover_origin.y);
+            let viewport = window.viewport_size();
+            let origin = point(
+                (popover_origin.x + horizontal_offset).max(px(4.)),
+                popover_origin
+                    .y
+                    .min((viewport.height - size.height - px(4.)).max(px(4.)))
+                    .max(px(4.)),
+            );
             let popover_bounds = Bounds::new(origin, size);
 
             self.editor.update(cx, |editor, _| {
@@ -7193,6 +7174,7 @@ fn render_blame_entry_popover(
     workspace: WeakEntity<Workspace>,
     blame: &Entity<GitBlame>,
     buffer: BufferId,
+    diff: Entity<crate::BlameDiff>,
     window: &mut Window,
     cx: &mut App,
 ) -> Option<AnyElement> {
@@ -7212,6 +7194,7 @@ fn render_blame_entry_popover(
         markdown,
         repository,
         workspace,
+        diff,
         window,
         cx,
     )
@@ -11359,6 +11342,7 @@ mod tests {
                 _: Entity<Markdown>,
                 _: Entity<project::git_store::Repository>,
                 _: WeakEntity<Workspace>,
+                _: Entity<crate::BlameDiff>,
                 _: &mut Window,
                 _: &mut App,
             ) -> Option<AnyElement> {
