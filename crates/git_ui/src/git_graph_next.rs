@@ -2343,6 +2343,14 @@ impl GitGraphNext {
         &self.log_source
     }
 
+    #[cfg(test)]
+    pub(crate) fn selected_commit_sha_for_test(&self) -> Option<Oid> {
+        self.graph_data
+            .commits
+            .get(self.selected_entry_idx?)
+            .map(|entry| entry.data.sha)
+    }
+
     pub fn set_repo_id(&mut self, repo_id: RepositoryId, cx: &mut Context<Self>) {
         if repo_id != self.repo_id
             && self

@@ -278,6 +278,26 @@ message CheckForPushedCommitsResponse {
   repeated string pushed_to = 1;
 }
 
+message RecentCommitsPageRequest {
+  uint64 offset = 1;
+  uint32 limit = 2;
+}
+
+message RecentCommit {
+  string sha = 1;
+  string subject = 2;
+  string message = 3;
+  string author_name = 4;
+  string author_email = 5;
+  string committer_name = 6;
+  string committer_email = 7;
+  int64 committer_timestamp = 8;
+}
+
+message RecentCommitsPageResponse {
+  repeated RecentCommit commits = 1;
+}
+
 message GitShow {
   uint64 project_id = 1;
   reserved 2;
@@ -810,6 +830,8 @@ message GetInitialGraphData {
     REVERSE_CHRONOLOGICAL = 3;
   }
   LogOrder log_order = 4;
+  // Keep personal-fork fields away from the upstream field sequence.
+  RecentCommitsPageRequest recent_commits_page = 1000;
 }
 
 message InitialGraphCommit {
@@ -820,6 +842,8 @@ message InitialGraphCommit {
 
 message GetInitialGraphDataResponse {
   repeated InitialGraphCommit commits = 1;
+  // Presence distinguishes an empty page from a server without pagination support.
+  RecentCommitsPageResponse recent_commits_page = 1000;
 }
 
 message SearchCommits {

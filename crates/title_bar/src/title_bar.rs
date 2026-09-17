@@ -218,6 +218,7 @@ pub struct TitleBar {
     _subscriptions: Vec<Subscription>,
     banner: Option<Entity<OnboardingBanner>>,
     update_version: Entity<UpdateVersion>,
+    recent_commits: Entity<git_ui::recent_commits_status::RecentCommitsStatus>,
     screen_share_popover_handle: PopoverMenuHandle<ContextMenu>,
     _diagnostics_subscription: Option<gpui::Subscription>,
 }
@@ -311,6 +312,7 @@ impl Render for TitleBar {
         children.push(
             h_flex()
                 .h_full()
+                .min_w_0()
                 .gap_0p5()
                 .map(|title_bar| {
                     let mut render_project_items = title_bar_settings.show_branch_name
@@ -353,8 +355,6 @@ impl Render for TitleBar {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .into_any_element(),
         );
-
-        children.push(self.render_collaborator_list(window, cx).into_any_element());
 
         if title_bar_settings.show_onboarding_banner {
             if let Some(banner) = &self.banner {
@@ -514,6 +514,8 @@ impl TitleBar {
         }
 
         let update_version = cx.new(|cx| UpdateVersion::new(cx));
+        let recent_commits =
+            cx.new(|cx| git_ui::recent_commits_status::RecentCommitsStatus::new(workspace, cx));
         let platform_titlebar = cx.new(|cx| {
             let mut titlebar = PlatformTitleBar::new(id, cx);
             if let Some(mw) = multi_workspace.clone() {
@@ -535,6 +537,7 @@ impl TitleBar {
             _subscriptions: subscriptions,
             banner,
             update_version,
+            recent_commits,
             screen_share_popover_handle: PopoverMenuHandle::default(),
             _diagnostics_subscription: None,
         };
@@ -1125,12 +1128,15 @@ impl TitleBar {
 
         Some(
             h_flex()
+                .min_w_0()
                 .gap_px()
                 .children(worktree_button)
                 .when(show_branch_separator, |this| this.child(separator()))
                 .children(branch_picker)
                 .when(show_graph_separator, |this| this.child(separator()))
                 .child(graph_button)
+                .child(separator())
+                .child(self.recent_commits.clone())
                 .into_any_element(),
         )
     }
@@ -1466,6 +1472,60 @@ impl TitleBar {
 mod tests {
     use super::*;
     use util::paths::PathStyle;
+
+    #[gpui::test]
+    async fn test_recent_commit_width_in_title_bar(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        let root = Path::new(util::path!("/project"));
+        let dot_git = root.join(".git");
+        fs::Fs::create_dir(fs.as_ref(), &dot_git).await.unwrap();
+        fs.set_head_for_repo(&dot_git, &[], "0123456789abcdef0123456789abcdef01234567");
+        let project = Project::test(fs, [root], cx).await;
+        cx.run_until_parked();
+        cx.update(|cx| {
+            call::init(project.read(cx).client(), project.read(cx).user_store(), cx);
+            super::init(cx);
+        });
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(800.)));
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let subject = cx.debug_bounds("RECENT_COMMITS_SUBJECT").unwrap();
+        let expected_width = cx.update(|window, cx| {
+            assert!(ActiveCall::global(cx).read(cx).room().is_none());
+            let text = "initial commit";
+            let run = gpui::TextRun {
+                len: text.len(),
+                font: theme::theme_settings(cx).ui_font(cx).clone(),
+                color: gpui::Hsla::default(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            window
+                .text_system()
+                .shape_line(
+                    text.into(),
+                    ui::TextSize::Small.rems(cx).to_pixels(window.rem_size()),
+                    &[run],
+                    None,
+                )
+                .width
+        });
+        assert!(
+            subject.size.width + gpui::px(1.) >= expected_width,
+            "commit subject was compressed despite available title bar space: {:?} < {:?}",
+            subject.size.width,
+            expected_width,
+        );
+    }
 
     #[test]
     fn test_foreign_path_style_does_not_use_repository_identity_as_name_anchor() {

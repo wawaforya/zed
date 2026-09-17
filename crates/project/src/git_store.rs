@@ -4050,6 +4050,42 @@ impl GitStore {
         let repository_id = RepositoryId::from_proto(payload.repository_id);
         let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
 
+        if let Some(page) = payload.recent_commits_page.as_ref() {
+            let Some(proto::git_log_source::Source::Sha(head)) = payload
+                .log_source
+                .as_ref()
+                .and_then(|source| source.source.as_ref())
+            else {
+                anyhow::bail!("paginated commit history requires a fixed HEAD SHA");
+            };
+            let head = head.parse()?;
+            let commits = repository_handle
+                .update(&mut cx, |repository, _| {
+                    repository.recent_commits(head, page.offset, page.limit)
+                })
+                .await??;
+            let (response_tx, response_rx) = mpsc::unbounded();
+            response_tx.unbounded_send(Ok(proto::GetInitialGraphDataResponse {
+                commits: Vec::new(),
+                recent_commits_page: Some(proto::RecentCommitsPageResponse {
+                    commits: commits
+                        .into_iter()
+                        .map(|commit| proto::RecentCommit {
+                            sha: commit.sha.to_string(),
+                            subject: commit.subject.into(),
+                            message: commit.message.into(),
+                            author_name: commit.author_name.into(),
+                            author_email: commit.author_email.into(),
+                            committer_name: commit.committer_name.into(),
+                            committer_email: commit.committer_email.into(),
+                            committer_timestamp: commit.committer_timestamp,
+                        })
+                        .collect(),
+                }),
+            }))?;
+            return Ok(response_rx);
+        }
+
         let log_order = log_order_from_proto(payload.log_order());
         let log_source = log_source_from_proto(
             payload
@@ -4097,6 +4133,7 @@ impl GitStore {
                         .iter()
                         .map(|commit| initial_graph_commit_to_proto(commit))
                         .collect(),
+                    recent_commits_page: None,
                 };
                 if response_tx.send(Ok(response)).await.is_err() {
                     return;
@@ -4126,6 +4163,7 @@ impl GitStore {
                             .iter()
                             .map(|commit| initial_graph_commit_to_proto(commit))
                             .collect(),
+                        recent_commits_page: None,
                     };
                     if response_tx.send(Ok(response)).await.is_err() {
                         return;
@@ -7149,6 +7187,41 @@ impl Repository {
         receiver
     }
 
+    pub fn recent_commits(
+        &mut self,
+        head: Oid,
+        offset: u64,
+        limit: u32,
+    ) -> oneshot::Receiver<Result<Vec<git::repository::RecentCommit>>> {
+        let id = self.id;
+        self.send_job("recent commits", None, move |repository, _cx| async move {
+            anyhow::ensure!((1..=100).contains(&limit), "invalid commit page size");
+            match repository {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.recent_commits(head, offset, limit).await
+                }
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    let mut responses = client
+                        .request_stream(proto::GetInitialGraphData {
+                            project_id: project_id.0,
+                            repository_id: id.to_proto(),
+                            log_source: Some(log_source_to_proto(&LogSource::Sha(head))),
+                            log_order: log_order_to_proto(LogOrder::DateOrder),
+                            recent_commits_page: Some(proto::RecentCommitsPageRequest {
+                                offset,
+                                limit,
+                            }),
+                        })
+                        .await?;
+                    let response = responses.next().await.context(
+                        "remote server returned no commit history page; update the remote server",
+                    )??;
+                    recent_commits_page_from_proto(response, limit)
+                }
+            }
+        })
+    }
+
     pub fn show(&mut self, commit: String) -> oneshot::Receiver<Result<CommitDetails>> {
         let id = self.id;
         self.send_job("show", None, move |git_repo, _cx| async move {
@@ -7509,6 +7582,7 @@ impl Repository {
                 repository_id: repository_id.to_proto(),
                 log_source: Some(log_source_to_proto(&log_source)),
                 log_order: log_order_to_proto(log_order),
+                recent_commits_page: None,
             })
             .await
             .map_err(|err| SharedString::from(err.to_string()))?;
@@ -11125,6 +11199,34 @@ fn log_order_from_proto(log_order: proto::get_initial_graph_data::LogOrder) -> L
     }
 }
 
+fn recent_commits_page_from_proto(
+    response: proto::GetInitialGraphDataResponse,
+    limit: u32,
+) -> Result<Vec<git::repository::RecentCommit>> {
+    let page = response.recent_commits_page.context(
+        "remote server does not support paginated commit history; update the remote server",
+    )?;
+    anyhow::ensure!(
+        page.commits.len() <= limit as usize,
+        "oversized commit history page"
+    );
+    page.commits
+        .into_iter()
+        .map(|commit| {
+            Ok(git::repository::RecentCommit {
+                sha: commit.sha.parse()?,
+                subject: commit.subject.into(),
+                message: commit.message.into(),
+                author_name: commit.author_name.into(),
+                author_email: commit.author_email.into(),
+                committer_name: commit.committer_name.into(),
+                committer_email: commit.committer_email.into(),
+                committer_timestamp: commit.committer_timestamp,
+            })
+        })
+        .collect()
+}
+
 fn initial_graph_commit_to_proto(commit: &InitialGraphCommitData) -> proto::InitialGraphCommit {
     proto::InitialGraphCommit {
         sha: commit.sha.to_string(),
@@ -11375,6 +11477,191 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    #[gpui::test]
+    async fn test_recent_commits_page_via_graph_request(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let root = Path::new(util::path!("/project"));
+        let dot_git = root.join(".git");
+        fs.insert_tree(root, json!({ ".git": {}, "file.txt": "content" }))
+            .await;
+        let commits = (1..=18)
+            .rev()
+            .map(|index| {
+                Arc::new(InitialGraphCommitData {
+                    sha: Oid::from_bytes(&[index; 20]).unwrap(),
+                    parents: if index > 1 {
+                        smallvec::smallvec![Oid::from_bytes(&[index - 1; 20]).unwrap()]
+                    } else {
+                        smallvec::smallvec![]
+                    },
+                    ref_names: Vec::new(),
+                })
+            })
+            .collect::<Vec<_>>();
+        fs.set_commit_data(
+            &dot_git,
+            commits.iter().map(|commit| {
+                (
+                    CommitData {
+                        sha: commit.sha,
+                        parents: commit.parents.clone(),
+                        author_name: "Author".into(),
+                        author_email: "author@example.com".into(),
+                        commit_timestamp: 1_700_000_000,
+                        subject: "Subject".into(),
+                        message: "Subject\n\nBody".into(),
+                    },
+                    false,
+                )
+            }),
+        );
+        fs.set_graph_commits(&dot_git, commits.clone());
+        let head = commits[0].sha;
+        fs.set_head_for_repo(&dot_git, &[], head.to_string());
+        let project = Project::test(fs, [root], cx).await;
+        cx.run_until_parked();
+        let (store, repository) = project.read_with(cx, |project, cx| {
+            (
+                project.git_store().clone(),
+                project.active_repository(cx).unwrap(),
+            )
+        });
+        let repository_id = repository.read_with(cx, |repository, _| repository.id.to_proto());
+        let request = |page| TypedEnvelope {
+            sender_id: proto::PeerId::default(),
+            original_sender_id: None,
+            message_id: 0,
+            received_at: std::time::Instant::now(),
+            payload: proto::GetInitialGraphData {
+                project_id: 0,
+                repository_id,
+                log_source: Some(log_source_to_proto(&LogSource::Sha(head))),
+                log_order: log_order_to_proto(LogOrder::DateOrder),
+                recent_commits_page: page,
+            },
+        };
+        for (offset, expected_count) in [(0, 8), (8, 8), (16, 2), (18, 0)] {
+            let mut responses = GitStore::handle_get_initial_graph_data(
+                store.clone(),
+                request(Some(proto::RecentCommitsPageRequest { offset, limit: 8 })),
+                cx.to_async(),
+            )
+            .await
+            .unwrap();
+            let response = responses.next().await.unwrap().unwrap();
+            assert!(response.commits.is_empty());
+            let page = recent_commits_page_from_proto(response, 8).unwrap();
+            assert_eq!(page.len(), expected_count);
+            assert_eq!(
+                page.iter().map(|commit| commit.sha).collect::<Vec<_>>(),
+                commits
+                    .iter()
+                    .skip(offset as usize)
+                    .take(8)
+                    .map(|commit| commit.sha)
+                    .collect::<Vec<_>>()
+            );
+            if let Some(commit) = page.first() {
+                assert_eq!(commit.message.as_ref(), "Subject\n\nBody");
+                assert_eq!(commit.committer_timestamp, 1_700_000_000);
+            }
+            assert!(responses.next().await.is_none());
+        }
+        repository.read_with(cx, |repository, _| {
+            assert!(
+                repository
+                    .get_graph_data(LogSource::Sha(head), LogOrder::DateOrder)
+                    .is_none()
+            );
+        });
+        for limit in [0, 101] {
+            assert!(
+                GitStore::handle_get_initial_graph_data(
+                    store.clone(),
+                    request(Some(proto::RecentCommitsPageRequest { offset: 0, limit })),
+                    cx.to_async(),
+                )
+                .await
+                .is_err()
+            );
+        }
+        let mut invalid = request(Some(proto::RecentCommitsPageRequest {
+            offset: 0,
+            limit: 8,
+        }));
+        invalid.payload.log_source = Some(log_source_to_proto(&LogSource::All));
+        assert!(
+            GitStore::handle_get_initial_graph_data(store.clone(), invalid, cx.to_async())
+                .await
+                .is_err()
+        );
+
+        // Requests without the extension must still stream the complete graph.
+        let mut responses =
+            GitStore::handle_get_initial_graph_data(store, request(None), cx.to_async())
+                .await
+                .unwrap();
+        let mut graph = Vec::new();
+        while let Some(response) = responses.next().await {
+            let response = response.unwrap();
+            assert!(response.recent_commits_page.is_none());
+            graph.extend(response.commits.into_iter().map(|commit| commit.sha));
+        }
+        assert_eq!(
+            graph,
+            commits
+                .iter()
+                .map(|commit| commit.sha.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_recent_commits_page_protocol_validation() {
+        let error =
+            recent_commits_page_from_proto(proto::GetInitialGraphDataResponse::default(), 8)
+                .unwrap_err();
+        assert!(error.to_string().contains("update the remote server"));
+        let response = |commits| proto::GetInitialGraphDataResponse {
+            commits: Vec::new(),
+            recent_commits_page: Some(proto::RecentCommitsPageResponse { commits }),
+        };
+        let empty_page = proto::Message::encode_to_vec(&response(Vec::new()));
+        let empty_page =
+            <proto::GetInitialGraphDataResponse as proto::Message>::decode(empty_page.as_slice())
+                .unwrap();
+        assert!(
+            recent_commits_page_from_proto(empty_page, 8)
+                .unwrap()
+                .is_empty()
+        );
+        let commit = proto::RecentCommit {
+            sha: Oid::from_bytes(&[1; 20]).unwrap().to_string(),
+            subject: "Subject".into(),
+            message: "Subject\n\nBody".into(),
+            author_name: "Author".into(),
+            author_email: "author@example.com".into(),
+            committer_name: "Committer".into(),
+            committer_email: "committer@example.com".into(),
+            committer_timestamp: 1_700_000_000,
+        };
+        let encoded = proto::Message::encode_to_vec(&response(vec![commit.clone()]));
+        let decoded =
+            <proto::GetInitialGraphDataResponse as proto::Message>::decode(encoded.as_slice())
+                .unwrap();
+        let page = recent_commits_page_from_proto(decoded, 8).unwrap();
+        assert_eq!(page[0].author_name.as_ref(), "Author");
+        assert_eq!(page[0].committer_name.as_ref(), "Committer");
+        assert_eq!(page[0].committer_email.as_ref(), "committer@example.com");
+        assert_eq!(page[0].committer_timestamp, 1_700_000_000);
+        assert!(recent_commits_page_from_proto(response(vec![commit; 9]), 8).is_err());
+        assert!(
+            recent_commits_page_from_proto(response(vec![proto::RecentCommit::default()]), 8)
+                .is_err()
+        );
     }
 
     type TestPasswordPrompt = (
