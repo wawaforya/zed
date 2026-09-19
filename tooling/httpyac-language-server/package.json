@@ -1,0 +1,39 @@
+{
+  "name": "httpyac-language-server",
+  "version": "0.4.0",
+  "private": true,
+  "description": "A side-effect-free language server for httpYac files.",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "dist/server.js",
+  "bin": {
+    "httpyac-language-server": "bin/httpyac-language-server.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/bundle.mjs",
+    "catalog": "node scripts/catalog.cjs",
+    "test:bundle": "node --test dist/test/stdio.test.js",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test \"dist/test/*.test.js\"",
+    "start": "node dist/server.js --stdio"
+  },
+  "dependencies": {
+    "vscode-languageserver": "9.0.1",
+    "vscode-languageserver-textdocument": "1.0.12"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "esbuild": "0.25.12",
+    "httpyac": "6.16.7",
+    "typescript": "5.7.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
