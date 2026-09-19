@@ -22,6 +22,7 @@ mod cpp;
 mod css;
 mod eslint;
 mod go;
+mod http;
 mod json;
 mod package_json;
 mod python;
@@ -85,7 +86,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
         fs.clone(),
     ));
     let vtsls_adapter = Arc::new(vtsls::VtslsLspAdapter::new(node.clone(), fs.clone()));
-    let yaml_lsp_adapter = Arc::new(yaml::YamlLspAdapter::new(node));
+    let yaml_lsp_adapter = Arc::new(yaml::YamlLspAdapter::new(node.clone()));
 
     let built_in_languages = [
         LanguageInfo {
@@ -132,6 +133,12 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
             name: "gowork",
             adapters: vec![go_lsp_adapter],
             context: Some(go_context_provider),
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "http",
+            adapters: vec![Arc::new(http::HttpYacLspAdapter::new(node.clone(), fs.clone()))],
+            context: Some(Arc::new(http::task_context())),
             ..Default::default()
         },
         LanguageInfo {
