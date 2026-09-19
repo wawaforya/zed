@@ -106,6 +106,7 @@ members = [
     "crates/http_client",
     "crates/http_client_tls",
     "crates/http_proxy",
+    "crates/httpyac_lsp",
     "crates/icons",
     "crates/image_viewer",
     "crates/input_latency_ui",
@@ -374,6 +375,7 @@ html_to_markdown = { path = "crates/html_to_markdown" }
 http_client = { path = "crates/http_client" }
 http_client_tls = { path = "crates/http_client_tls" }
 http_proxy = { path = "crates/http_proxy" }
+httpyac_lsp = { path = "crates/httpyac_lsp" }
 icons = { path = "crates/icons" }
 image_viewer = { path = "crates/image_viewer" }
 input_latency_ui = { path = "crates/input_latency_ui" }

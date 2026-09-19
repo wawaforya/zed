@@ -1,0 +1,129 @@
+[
+  {
+    "label": "HTTP: $ZED_CUSTOM_method $ZED_CUSTOM_url",
+    "command": "node",
+    "args": [
+      "-e",
+      "\"require(process.env.ZED_CUSTOM_HTTPYAC_EXECUTOR)\"",
+      "--",
+      "send",
+      "--output",
+      "response"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "tags": ["http-request"],
+    "save": "current",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always",
+    "hide": "never"
+  },
+  {
+    "label": "HTTP: $ZED_CUSTOM_name — $ZED_CUSTOM_method $ZED_CUSTOM_url",
+    "command": "node",
+    "args": [
+      "-e",
+      "\"require(process.env.ZED_CUSTOM_HTTPYAC_EXECUTOR)\"",
+      "--",
+      "send",
+      "--output",
+      "response"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "tags": ["http-request-named"],
+    "save": "current",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always",
+    "hide": "never"
+  },
+  {
+    "label": "HTTP: Send request headers at line $ZED_ROW",
+    "command": "node",
+    "args": [
+      "-e",
+      "\"require(process.env.ZED_CUSTOM_HTTPYAC_EXECUTOR)\"",
+      "--",
+      "send",
+      "--output",
+      "headers"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "save": "current",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always",
+    "hide": "never"
+  },
+  {
+    "label": "HTTP: Send request body at line $ZED_ROW",
+    "command": "node",
+    "args": [
+      "-e",
+      "\"require(process.env.ZED_CUSTOM_HTTPYAC_EXECUTOR)\"",
+      "--",
+      "send",
+      "--output",
+      "body"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "save": "current",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always",
+    "hide": "never"
+  },
+  {
+    "label": "HTTP: Send request exchange at line $ZED_ROW",
+    "command": "node",
+    "args": [
+      "-e",
+      "\"require(process.env.ZED_CUSTOM_HTTPYAC_EXECUTOR)\"",
+      "--",
+      "send",
+      "--output",
+      "exchange"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "save": "current",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always",
+    "hide": "never"
+  },
+  {
+    "label": "HTTP: Send all requests in $ZED_FILENAME",
+    "command": "node",
+    "args": [
+      "-e",
+      "\"require(process.env.ZED_CUSTOM_HTTPYAC_EXECUTOR)\"",
+      "--",
+      "send",
+      "--all",
+      "--output",
+      "response"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "save": "current",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always",
+    "hide": "never"
+  },
+  {
+    "label": "HTTP: Reset execution sessions for this project",
+    "command": "node",
+    "args": [
+      "-e",
+      "\"require(process.env.ZED_CUSTOM_HTTPYAC_EXECUTOR)\"",
+      "--",
+      "reset"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "save": "none",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always",
+    "hide": "never"
+  }
+]

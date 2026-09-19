@@ -1,0 +1,37 @@
+{
+  "grammars": [
+    {
+      "name": "httpyac",
+      "camelcase": "HttpYac",
+      "scope": "source.httpyac",
+      "path": ".",
+      "file-types": [
+        "http",
+        "rest"
+      ],
+      "highlights": "queries/highlights.scm",
+      "injections": "queries/injections.scm",
+      "injection-regex": "^(http|httpyac|rest)$"
+    }
+  ],
+  "metadata": {
+    "version": "0.3.0",
+    "license": "MIT",
+    "description": "Tree-sitter grammar for the httpYac HTTP client dialect",
+    "authors": [
+      {
+        "name": "zed-http contributors"
+      }
+    ]
+  },
+  "bindings": {
+    "c": false,
+    "go": false,
+    "java": false,
+    "node": false,
+    "python": false,
+    "rust": false,
+    "swift": false,
+    "zig": false
+  }
+}
