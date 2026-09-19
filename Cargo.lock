@@ -7817,6 +7817,7 @@ name = "grammars"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cc",
  "language_core",
  "rust-embed",
  "tree-sitter",
@@ -7831,6 +7832,7 @@ dependencies = [
  "tree-sitter-gowork",
  "tree-sitter-jsdoc",
  "tree-sitter-json",
+ "tree-sitter-language",
  "tree-sitter-md",
  "tree-sitter-python",
  "tree-sitter-regex",

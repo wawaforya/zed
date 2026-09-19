@@ -1,0 +1,351 @@
+==========================
+HTTP, WebDAV and protocols
+==========================
+
+PROPFIND https://example.com/dav
+
+###
+MKCALENDAR https://example.com/calendars/demo
+
+###
+GRPC grpc://127.0.0.1:50051/example.Service/Get
+proto < ./example.proto
+
+###
+GRAPHQL https://example.com/graphql
+
+###
+WS ws://127.0.0.1:8080/socket
+
+###
+SSE https://example.com/events
+
+###
+MQTT mqtt://broker.example.com
+
+###
+AMQP amqp://broker.example.com
+
+---
+
+(document
+  (section
+    (request
+      (method)
+      (target_url)))
+  (section
+    (request_separator)
+    (request
+      (method)
+      (target_url)))
+  (section
+    (request_separator)
+    (request
+      (method)
+      (target_url)
+      (proto_import
+        (path))))
+  (section
+    (request_separator)
+    (request
+      (method)
+      (target_url)))
+  (section
+    (request_separator)
+    (request
+      (method)
+      (target_url)))
+  (section
+    (request_separator)
+    (request
+      (method)
+      (target_url)))
+  (section
+    (request_separator)
+    (request
+      (method)
+      (target_url)))
+  (section
+    (request_separator)
+    (request
+      (method)
+      (target_url))))
+
+=================
+Explicit metadata
+=================
+
+# @name login
+# @ref bootstrap
+# @forceRef refresh
+# @import ./shared.http
+# @loop for item of items
+GET https://example.com/login
+
+---
+
+(document
+  (section
+    (metadata
+      (name_metadata
+        (metadata_key)
+        (value)))
+    (metadata
+      (ref_metadata
+        (metadata_key)
+        (value)))
+    (metadata
+      (force_ref_metadata
+        (metadata_key)
+        (value)))
+    (metadata
+      (import_metadata
+        (metadata_key)
+        (value)))
+    (metadata
+      (generic_metadata
+        (identifier)
+        (value)))
+    (request
+      (method)
+      (target_url))))
+
+=================================
+Eager, lazy and global variables
+=================================
+
+@baseUrl = https://example.com
+@token := {{login.access_token}}
+@global.traceId = {{$random.uuid()}}
+
+GET {{baseUrl}}/users/{{login.user.id}}?trace={{traceId}}
+
+---
+
+(document
+  (section
+    (variable_declaration
+      (identifier)
+      (value))
+    (lazy_variable_declaration
+      (identifier)
+      (value
+        (variable
+          (variable_name))))
+    (variable_declaration
+      (variable_scope)
+      (identifier)
+      (value
+        (variable
+          (variable_name))))
+    (request
+      (method)
+      (target_url
+        (variable
+          (variable_name))
+        (variable
+          (variable_name))
+        (variable
+          (variable_name))))))
+
+====================
+Native script events
+====================
+
+{{
+exports.globalValue = "safe to parse";
+}}
+
+{{+request
+request.headers["x-test"] = "value";
+}}
+
+GET https://example.com/items
+
+{{@streaming
+exports.message = response.body;
+}}
+
+{{@response
+exports.responseValue = response.body.id;
+}}
+
+---
+
+(document
+  (section
+    (native_script
+      (script_body))
+    (native_script
+      (script_modifier)
+      (script_event)
+      (script_body))
+    (request
+      (method)
+      (target_url)
+      (native_script
+        (script_modifier)
+        (script_event)
+        (script_body))
+      (native_script
+        (script_modifier)
+        (script_event)
+        (script_body)))))
+
+============================
+IntelliJ pre/post handlers
+============================
+
+< {% request.variables.set("trace", "value"); %}
+GET https://example.com/items
+
+> {%
+client.global.set("itemId", response.body.id);
+%}
+
+---
+
+(document
+  (section
+    (pre_request_script
+      (script
+        (inline_script_body)))
+    (request
+      (method)
+      (target_url)
+      (res_handler_script
+        (script
+          (script_body))))))
+
+==========
+Assertions
+==========
+
+GET https://example.com/items
+
+?? status == 200
+?? duration < 1000
+?? header content-type contains application/json
+?? body $.items exists
+
+---
+
+(document
+  (section
+    (request
+      (method)
+      (target_url)
+      (assertion
+        (assertion_type)
+        (assertion_expression))
+      (assertion
+        (assertion_type)
+        (assertion_expression))
+      (assertion
+        (assertion_type)
+        (assertion_expression))
+      (assertion
+        (assertion_type)
+        (assertion_expression)))))
+
+===========================
+Streaming message separator
+===========================
+
+MQTT mqtt://broker.example.com
+topic: httpyac
+
+Send one
+===
+Send two
+=== wait-for-server
+Send three
+
+---
+
+(document
+  (section
+    (request
+      (method)
+      (target_url)
+      (header
+        (header_entity)
+        (value))
+      (raw_body)
+      (message_separator)
+      (raw_body)
+      (message_separator
+        (value))
+      (raw_body))))
+
+====================================
+External body, redirect and response
+====================================
+
+POST https://example.com/items
+Content-Type: application/json
+
+<@ ./payload.json
+
+>>! ./response.json
+
+###
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{
+  "id": 1
+}
+
+---
+
+(document
+  (section
+    (request
+      (method)
+      (target_url)
+      (header
+        (header_entity)
+        (value))
+      (external_body
+        (path))
+      (res_redirect
+        (path))))
+  (section
+    (request_separator)
+    (response
+      (http_version)
+      (status_code)
+      (status_text)
+      (header
+        (header_entity)
+        (value))
+      (json_body))))
+
+===========================
+Recover incomplete editing
+===========================
+
+# @name
+POST {{baseUrl}}/items
+Content-Type: application/json
+
+{
+  "name": "{{item
+
+---
+
+(document
+  (section
+    (metadata
+      (name_metadata
+        (metadata_key)))
+    (request
+      (method)
+      (target_url
+        (variable
+          (variable_name)))
+      (header
+        (header_entity)
+        (value))
+      (json_body))))

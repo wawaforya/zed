@@ -17,6 +17,7 @@ rust-embed.workspace = true
 util.workspace = true
 
 tree-sitter = { workspace = true, optional = true }
+tree-sitter-language = { version = "0.1", optional = true }
 tree-sitter-bash = { workspace = true, optional = true }
 tree-sitter-c = { workspace = true, optional = true }
 tree-sitter-cpp = { workspace = true, optional = true }
@@ -35,9 +36,13 @@ tree-sitter-rust = { workspace = true, optional = true }
 tree-sitter-typescript = { workspace = true, optional = true }
 tree-sitter-yaml = { workspace = true, optional = true }
 
+[build-dependencies]
+cc = "1"
+
 [features]
 load-grammars = [
     "tree-sitter",
+    "tree-sitter-language",
     "tree-sitter-bash",
     "tree-sitter-c",
     "tree-sitter-cpp",

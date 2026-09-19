@@ -66,6 +66,24 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn test_built_in_http_snippets() {
+        let source = include_str!("snippets/http.json");
+        let file: crate::format::VsSnippetsFile = serde_json_lenient::from_str(source).unwrap();
+        let expected = file.snippets.len();
+        let registry = SnippetRegistry::new();
+        registry
+            .register_snippets(Path::new("http.json"), source)
+            .unwrap();
+        let snippets = registry.get_snippets(&Some("http".to_owned()));
+        assert_eq!(snippets.len(), expected);
+        assert!(
+            snippets
+                .iter()
+                .any(|snippet| snippet.prefix.iter().any(|prefix| prefix == "get"))
+        );
+    }
+
+    #[test]
     fn test_register_snippets_single_language() {
         let registry = SnippetRegistry::new();
         registry

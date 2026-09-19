@@ -22,6 +22,7 @@ mod cpp;
 mod css;
 mod eslint;
 mod go;
+mod http;
 mod json;
 mod package_json;
 mod python;
@@ -132,6 +133,11 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
             name: "gowork",
             adapters: vec![go_lsp_adapter],
             context: Some(go_context_provider),
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "http",
+            context: Some(Arc::new(http::task_context())),
             ..Default::default()
         },
         LanguageInfo {

@@ -19,6 +19,9 @@ use util::ResultExt;
 
 pub fn init(cx: &mut App) {
     SnippetRegistry::init_global(cx);
+    SnippetRegistry::global(cx)
+        .register_snippets(Path::new("http.json"), include_str!("snippets/http.json"))
+        .log_err();
     extension_snippet::init(cx);
 }
 

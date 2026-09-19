@@ -1,0 +1,232 @@
+{
+  "GET request": {
+    "prefix": "get",
+    "body": [
+      "GET ${1:https://example.com/api/resource}",
+      "Accept: application/json",
+      "",
+      "$0"
+    ],
+    "description": "Create an HTTP GET request"
+  },
+  "POST JSON request": {
+    "prefix": "post",
+    "body": [
+      "POST ${1:https://example.com/api/resource}",
+      "Content-Type: application/json",
+      "Accept: application/json",
+      "",
+      "{",
+      "  \"${2:key}\": \"${3:value}\"",
+      "}",
+      "$0"
+    ],
+    "description": "Create an HTTP POST request with a JSON body"
+  },
+  "PUT JSON request": {
+    "prefix": "put",
+    "body": [
+      "PUT ${1:https://example.com/api/resource}",
+      "Content-Type: application/json",
+      "Accept: application/json",
+      "",
+      "{",
+      "  \"${2:key}\": \"${3:value}\"",
+      "}",
+      "$0"
+    ],
+    "description": "Create an HTTP PUT request with a JSON body"
+  },
+  "PATCH JSON request": {
+    "prefix": "patch",
+    "body": [
+      "PATCH ${1:https://example.com/api/resource}",
+      "Content-Type: application/json",
+      "Accept: application/json",
+      "",
+      "{",
+      "  \"${2:key}\": \"${3:value}\"",
+      "}",
+      "$0"
+    ],
+    "description": "Create an HTTP PATCH request with a JSON body"
+  },
+  "DELETE request": {
+    "prefix": "delete",
+    "body": [
+      "DELETE ${1:https://example.com/api/resource}",
+      "Accept: application/json",
+      "",
+      "$0"
+    ],
+    "description": "Create an HTTP DELETE request"
+  },
+  "Request separator": {
+    "prefix": "separator",
+    "body": [
+      "### ${1:Request title}",
+      "$0"
+    ],
+    "description": "Separate HTTP requests"
+  },
+  "Named request": {
+    "prefix": "@name",
+    "body": [
+      "# @name ${1:requestName}",
+      "$0"
+    ],
+    "description": "Name a request so its parsed response body can be referenced"
+  },
+  "Reference request": {
+    "prefix": "@ref",
+    "body": [
+      "# @ref ${1:requestName}",
+      "$0"
+    ],
+    "description": "Execute a named dependency when needed and import its variables"
+  },
+  "Force reference request": {
+    "prefix": "@forceRef",
+    "body": [
+      "# @forceRef ${1:requestName}",
+      "$0"
+    ],
+    "description": "Always execute a named dependency and import its variables"
+  },
+  "Import HTTP variables": {
+    "prefix": "@import",
+    "body": [
+      "# @import ${1:./variables.http}",
+      "$0"
+    ],
+    "description": "Import global variables or named requests from another HTTP file"
+  },
+  "Variable declaration": {
+    "prefix": "@variable",
+    "body": [
+      "@${1:name} = ${2:value}",
+      "$0"
+    ],
+    "description": "Declare an httpYac variable"
+  },
+  "Bearer authorization": {
+    "prefix": "bearer",
+    "body": [
+      "Authorization: Bearer {{${1:accessToken}}}",
+      "$0"
+    ],
+    "description": "Add a Bearer authorization header"
+  },
+  "JSON content headers": {
+    "prefix": "jsonheaders",
+    "body": [
+      "Content-Type: application/json",
+      "Accept: application/json",
+      "$0"
+    ],
+    "description": "Add JSON Content-Type and Accept headers"
+  },
+  "Export response values": {
+    "prefix": "response-export",
+    "body": [
+      "> {%",
+      "client.global.set(\"${1:responseValue}\", response.body.${2:property});",
+      "client.global.set(\"${3:responseHeader}\", response.headers.valueOf(\"${4:header-name}\"));",
+      "%}",
+      "$0"
+    ],
+    "description": "Export response body and header values with an httpYac/IntelliJ response handler"
+  },
+  "OAuth2 client credentials": {
+    "prefix": "oauth2-client",
+    "body": [
+      "@oauth2_tokenEndpoint = ${1:https://identity.example.com/oauth/token}",
+      "@oauth2_clientId = ${2:client-id}",
+      "@oauth2_clientSecret = ${3:client-secret}",
+      "",
+      "GET ${4:https://api.example.com/resource}",
+      "Authorization: oauth2",
+      "Accept: application/json",
+      "",
+      "$0"
+    ],
+    "description": "Create an OAuth2 client-credentials request using httpYac variables"
+  },
+  "Loop request": {
+    "prefix": "@loop",
+    "body": [
+      "# @loop for ${1:3}",
+      "${2:GET} ${3:https://example.com/items}/{{\\$index}}",
+      "Accept: application/json",
+      "",
+      "$0"
+    ],
+    "description": "Repeat a request with httpYac loop metadata"
+  },
+  "Response assertions": {
+    "prefix": "assert",
+    "body": [
+      "?? status == ${1:200}",
+      "?? duration < ${2:1000}",
+      "?? header ${3:content-type} contains ${4:application/json}",
+      "?? body ${5:contains} ${6:value}",
+      "$0"
+    ],
+    "description": "Add httpYac response assertions"
+  },
+  "GraphQL request": {
+    "prefix": "graphql",
+    "body": [
+      "GRAPHQL ${1:https://example.com/graphql}",
+      "Authorization: Bearer {{${2:accessToken}}}",
+      "",
+      "query ${3:OperationName} {",
+      "  ${4:viewer} {",
+      "    ${5:id}",
+      "  }",
+      "}",
+      "",
+      "{",
+      "  \"${6:variables}\": {}",
+      "}",
+      "$0"
+    ],
+    "description": "Create an httpYac GraphQL request"
+  },
+  "gRPC request": {
+    "prefix": "grpc",
+    "body": [
+      "GRPC ${1:grpc://127.0.0.1:50051/package.Service/Method}",
+      "proto < ${2:./service.proto}",
+      "",
+      "{",
+      "  \"${3:key}\": \"${4:value}\"",
+      "}",
+      "$0"
+    ],
+    "description": "Create an httpYac gRPC request with a proto file"
+  },
+  "WebSocket request": {
+    "prefix": "websocket",
+    "body": [
+      "WEBSOCKET ${1:ws://127.0.0.1:8080/socket}",
+      "Content-Type: application/json",
+      "",
+      "{",
+      "  \"${2:type}\": \"${3:ping}\"",
+      "}",
+      "$0"
+    ],
+    "description": "Create an httpYac WebSocket request"
+  },
+  "Streaming response script": {
+    "prefix": "streaming-script",
+    "body": [
+      "{{@streaming",
+      "  ${1:exports.message = response.body;}",
+      "}}",
+      "$0"
+    ],
+    "description": "Handle each streaming message with an httpYac JavaScript block"
+  }
+}
