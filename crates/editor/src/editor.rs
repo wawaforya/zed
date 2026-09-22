@@ -4898,6 +4898,16 @@ impl Editor {
         };
         // Fill in the environmental variables from the tree-sitter captures
         let mut captured_task_variables = TaskVariables::default();
+        if buffer
+            .read(cx)
+            .language()
+            .is_some_and(|language| language.name().as_ref() == "HTTP")
+        {
+            captured_task_variables.insert(
+                task::VariableName::Custom("SOURCE_EDITOR".into()),
+                cx.entity_id().as_u64().to_string(),
+            );
+        }
         for (capture_name, value) in tasks.extra_variables.clone() {
             captured_task_variables.insert(
                 task::VariableName::Custom(capture_name.into()),

@@ -144,7 +144,13 @@ mod tests {
     fn request_tasks_use_the_persistent_executor() {
         let tasks: task::TaskTemplates =
             serde_json::from_str(include_str!("../../grammars/src/http/tasks.json")).unwrap();
-        assert_eq!(tasks.0.len(), 7);
+        assert_eq!(tasks.0.len(), 8);
+        assert_eq!(
+            tasks.0.iter().filter(|task| {
+                task.env.get("ZED_HTTPYAC_UI").map(String::as_str) == Some("1")
+            }).count(),
+            7,
+        );
         for template in &tasks.0 {
             assert_eq!(template.command, "node");
             assert_eq!(template.cwd.as_deref(), Some("$ZED_WORKTREE_ROOT"));

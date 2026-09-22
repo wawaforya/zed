@@ -14,6 +14,40 @@ const digest = value => crypto.createHash('sha256').update(value).digest('hex');
 const owner = Number(process.env.ZED_CUSTOM_HTTPYAC_OWNER);
 const sessionDirectory = path.dirname(__filename);
 const MAX_MESSAGE = 2 * 1024 * 1024;
+const machine = process.argv.includes('--json') && process.argv[2] !== '--server';
+let machineConnection;
+let machineClosed = false;
+
+function emit(message) {
+    process.stdout.write(JSON.stringify(message) + '\n');
+}
+
+function bounded(value, length = 16384) {
+    const text = typeof value === 'string' ? value : JSON.stringify(value) || '';
+    return text.length > length ? text.slice(0, length) + '\n[preview truncated]' : text;
+}
+
+function responseEvent(response, region) {
+    const raw = response.rawBody || (Buffer.isBuffer(response.body) ? response.body : Buffer.from(typeof response.body === 'string' ? response.body : JSON.stringify(response.body) || ''));
+    const limit = 512 * 1024;
+    const request = response.request;
+    const contentType = String(response.headers?.['content-type'] || '');
+    const binary = contentType && !/^(?:text\/|application\/(?:[^;]*json|[^;]*xml|javascript|x-www-form-urlencoded))/i.test(contentType);
+    const text = binary ? '[Binary response — use Save Body to export the bytes]' : typeof response.body === 'string' ? response.body : raw.toString('utf8');
+    const headers = response.rawHeaders
+        ? response.rawHeaders.reduce((lines, value, index, values) => { if (index % 2 === 0) lines.push(`${value}: ${values[index + 1] || ''}`); return lines; }, []).join('\n')
+        : Object.entries(response.headers || {}).flatMap(([name, value]) => (Array.isArray(value) ? value : [value]).map(value => `${name}: ${value}`)).join('\n');
+    return {
+        type: 'response', name: bounded(region?.metaData?.name || region?.symbol?.name || 'Response', 512),
+        status: response.statusCode, statusMessage: bounded(response.statusMessage || '', 512),
+        headers: bounded(headers),
+        request: bounded(request ? `${request.method || ''} ${request.url}\n${JSON.stringify(request.headers || {}, null, 2)}\n\n${typeof request.body === 'string' ? request.body : JSON.stringify(request.body) || ''}` : ''),
+        body: bounded(text, 128 * 1024),
+        rawBody: raw.subarray(0, limit).toString('base64'), bodyBytes: raw.length,
+        truncated: raw.length > limit, textTruncated: text.length > 128 * 1024,
+        contentType: bounded(contentType, 512), timings: response.timings || {},
+    };
+}
 
 function alive(pid) {
     if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -189,6 +223,10 @@ async function prompt(engine, message) {
 
 async function exchange(connection, request, engine) {
     const { socket, record } = connection;
+    if (machine) {
+        if (machineClosed) { socket.destroy(); throw new Error('Response view disconnected before execution'); }
+        machineConnection = socket;
+    }
     return new Promise((resolve, reject) => {
         let finished = false;
         const interrupt = () => { socket.destroy(); process.exitCode = 130; };
@@ -201,7 +239,12 @@ async function exchange(connection, request, engine) {
             if (!finished) reject(new Error('Execution session disconnected. The request may have been sent; it will NOT be retried automatically.'));
         });
         frames(socket, message => {
-            if (message.type === 'output') {
+            if (machine && !['done', 'restart'].includes(message.type)) {
+                if (!process.stdout.write(JSON.stringify(message) + '\n')) {
+                    socket.pause();
+                    process.stdout.once('drain', () => socket.resume());
+                }
+            } else if (message.type === 'output') {
                 const output = message.stream === 'stderr' ? process.stderr : process.stdout;
                 if (!output.write(message.text)) {
                     socket.pause();
@@ -222,6 +265,23 @@ async function exchange(connection, request, engine) {
 }
 
 async function client() {
+    if (machine) {
+        let lastHeartbeat = Date.now();
+        frames(process.stdin, message => {
+            lastHeartbeat = Date.now();
+            if (message.type === 'ping') return;
+            if (message.type === 'cancel') { machineClosed = true; machineConnection?.destroy(); return; }
+            if (typeof message.answer !== 'string') throw new Error('Invalid response view input');
+            if (machineConnection) transmit(machineConnection, message);
+        });
+        process.stdin.on('end', () => { machineClosed = true; machineConnection?.destroy(); });
+        process.stdin.on('error', () => { machineClosed = true; machineConnection?.destroy(); });
+        // A broken remote transport must not leave an invisible request or prompt running.
+        const heartbeat = setInterval(() => {
+            if (Date.now() - lastHeartbeat > 15000) { machineConnection?.destroy(); process.exit(130); }
+        }, 2000);
+        heartbeat.unref();
+    }
     const args = process.argv.slice(1);
     const operation = args[0];
     if (!['send', 'reset'].includes(operation)) throw new Error('Expected send or reset');
@@ -240,7 +300,8 @@ async function client() {
             const result = await exchange({ record, socket: await connect(record) }, { operation: 'reset' }, config.engine);
             if (result.code !== 0) throw new Error('Session reset failed');
         }
-        console.log('HTTP execution sessions reset for this project.');
+        if (machine) emit({ type: 'output', stream: 'stdout', text: 'HTTP execution sessions reset for this project.\n' });
+        else console.log('HTTP execution sessions reset for this project.');
         return;
     }
     const file = fs.realpathSync(process.env.ZED_FILE || '');
@@ -248,7 +309,7 @@ async function client() {
     if (line !== undefined && (!Number.isInteger(line) || line < 1)) throw new Error('ZED_ROW must be a one-based line number.');
     for (let attempt = 0; attempt < 3; attempt++) {
         const connection = await session(config, true);
-        const result = await exchange(connection, { operation, file, line, output }, config.engine);
+        const result = await exchange(connection, { operation, file, line, output, structured: machine }, config.engine);
         if (result.type === 'restart') { await delay(80); continue; }
         process.exitCode = result.code;
         return;
@@ -445,6 +506,10 @@ async function server(config) {
                 progress: { isCanceled: () => active?.canceled ?? true, register: callback => { const callbacks = active.cancellations; callbacks.add(callback); return () => callbacks.delete(callback); } },
                 logResponse: async (response, region) => {
                     if (response) {
+                        if (message.structured) {
+                            transmit(connection, responseEvent(response, region));
+                            return;
+                        }
                         output('stdout', `\n${region?.metaData?.name || region?.symbol?.name || 'Response'}\n`);
                         const options = { responseBodyPrettyPrint: true, responseHeaders: message.output !== 'body', responseBodyLength: message.output === 'headers' ? undefined : 0, requestOutput: message.output === 'exchange', requestHeaders: message.output === 'exchange', requestBodyLength: message.output === 'exchange' ? 0 : undefined };
                         await engine.utils.requestLoggerFactory(text => output('stdout', text + '\n'), options)(response, region);
@@ -457,9 +522,16 @@ async function server(config) {
                 context.httpRegion = httpFile.httpRegions.find(region => !region.isGlobal() && region.symbol.startLine <= line && region.symbol.endLine >= line);
                 if (!context.httpRegion) throw new Error(`No request at line ${message.line}; select its request line.`);
             }
+            if (message.structured) {
+                const regions = context.httpRegion ? [context.httpRegion] : httpFile.httpRegions.filter(region => !region.isGlobal());
+                transmit(connection, { type: 'started', streaming: regions.some(region => ['WS', 'SSE'].includes(region.request?.protocol)) });
+            }
             const success = await engine.send(context);
             const tests = context.processedHttpRegions.flatMap(region => region.testResults || []);
-            for (const test of tests.filter(test => ['ERROR', 'FAILED'].includes(test.status))) output('stderr', `${test.status}: ${test.message}\n`);
+            for (const test of tests) {
+                if (message.structured) transmit(connection, { type: 'test', status: bounded(test.status, 128), message: bounded(test.message) });
+                else if (['ERROR', 'FAILED'].includes(test.status)) output('stderr', `${test.status}: ${test.message}\n`);
+            }
             const failed = !success || tests.some(test => ['ERROR', 'FAILED'].includes(test.status));
             // Include modules loaded by request scripts/configuration in the next preflight.
             for (const filename of Object.keys(require.cache)) {
@@ -530,5 +602,14 @@ async function server(config) {
 if (process.argv[2] === '--server') {
     server(JSON.parse(process.argv[3])).catch(error => { console.error(error); process.exitCode = 1; });
 } else {
-    client().catch(error => { console.error(error.message); process.exitCode = process.exitCode || 1; });
+    client().then(() => {
+        if (machine) { emit({ type: 'done', code: process.exitCode || 0 }); process.stdin.destroy(); }
+    }).catch(error => {
+        if (machine) {
+            emit({ type: 'error', message: error.message });
+            emit({ type: 'done', code: process.exitCode || 1 });
+            process.stdin.destroy();
+        } else console.error(error.message);
+        process.exitCode = process.exitCode || 1;
+    });
 }

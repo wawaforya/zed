@@ -380,6 +380,22 @@ pub fn task_contexts(
         });
 
     let active_editor = active_item.and_then(|item| item.act_as::<Editor>(cx));
+    let http_source_editor = active_editor
+        .as_ref()
+        .filter(|editor| {
+            editor
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .is_some_and(|buffer| {
+                    buffer
+                        .read(cx)
+                        .language()
+                        .is_some_and(|language| language.name().as_ref() == "HTTP")
+                })
+        })
+        .map(|editor| editor.entity_id().as_u64().to_string());
 
     let editor_context_task = active_editor.as_ref().map(|active_editor| {
         active_editor.update(cx, |editor, cx| editor.task_context(window, cx))
@@ -431,8 +447,13 @@ pub fn task_contexts(
         task_contexts.latest_selection = latest_selection;
 
         if let Some(editor_context_task) = editor_context_task
-            && let Some(editor_context) = editor_context_task.await
+            && let Some(mut editor_context) = editor_context_task.await
         {
+            if let Some(source) = http_source_editor {
+                editor_context
+                    .task_variables
+                    .insert(VariableName::Custom("SOURCE_EDITOR".into()), source);
+            }
             task_contexts.active_item_context = Some((active_worktree, location, editor_context));
         }
 
@@ -697,6 +718,52 @@ mod tests {
                 ]),
                 project_env: HashMap::default(),
             }
+        );
+    }
+
+    #[gpui::test]
+    async fn http_context_keeps_the_invoking_editor_when_tabs_change(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({"request.http": "GET https://example.test"}),
+        ).await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let buffer = project.update(cx, |project, cx| {
+            project.open_buffer((worktree_id, rel_path("request.http")), cx)
+        }).await.unwrap();
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_language(Some(Arc::new(Language::new(
+                LanguageConfig { name: "HTTP".into(), ..Default::default() },
+                None,
+            ))), cx);
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(cx, |multi_workspace, _| {
+            multi_workspace.workspace().clone()
+        });
+        let source = cx.new_window_entity(|window, cx| {
+            Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx)
+        });
+        let other = cx.new_window_entity(|window, cx| {
+            Editor::for_buffer(buffer, Some(project), window, cx)
+        });
+        let context = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_center(Box::new(source.clone()), window, cx);
+            let context = task_contexts(workspace, window, cx);
+            workspace.add_item_to_center(Box::new(other), window, cx);
+            context
+        }).await;
+        assert_eq!(
+            context.active_context().unwrap().task_variables
+                .get(&VariableName::Custom("SOURCE_EDITOR".into())),
+            Some(source.entity_id().as_u64().to_string().as_str()),
         );
     }
 
