@@ -90,6 +90,7 @@ pub struct BufferSearchBar {
     search_history: SearchHistory,
     search_history_cursor: SearchHistoryCursor,
     replace_enabled: bool,
+    replacement_allowed: bool,
     selection_search_enabled: Option<FilteredSearchRange>,
     scroll_handle: ScrollHandle,
     regex_language: Option<Arc<Language>>,
@@ -890,6 +891,7 @@ impl BufferSearchBar {
             search_history_cursor: Default::default(),
             active_search: None,
             replace_enabled: false,
+            replacement_allowed: true,
             selection_search_enabled: None,
             scroll_handle: ScrollHandle::new(),
             regex_language: None,
@@ -942,6 +944,11 @@ impl BufferSearchBar {
         cx.notify();
     }
 
+    pub fn disallow_replacement(&mut self) {
+        self.replacement_allowed = false;
+        self.replace_enabled = false;
+    }
+
     pub fn deploy(
         &mut self,
         deploy: &Deploy,
@@ -949,6 +956,7 @@ impl BufferSearchBar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        let replace_enabled = deploy.replace_enabled && self.replacement_allowed && !self.embedded;
         let filtered_search_range = if deploy.selection_search_enabled {
             Some(FilteredSearchRange::Default)
         } else {
@@ -961,7 +969,7 @@ impl BufferSearchBar {
             self.search_suggested(seed_query_override, window, cx);
             self.smartcase(window, cx);
             self.sync_select_next_case_sensitivity(cx);
-            self.replace_enabled |= deploy.replace_enabled && !self.embedded;
+            self.replace_enabled |= replace_enabled;
             self.selection_search_enabled =
                 self.selection_search_enabled
                     .or(if deploy.selection_search_enabled {
@@ -976,7 +984,7 @@ impl BufferSearchBar {
                 let has_seed_text = self
                     .query_suggestion(seed_query_override, window, cx)
                     .is_some();
-                if deploy.replace_enabled && !self.embedded && has_seed_text {
+                if replace_enabled && has_seed_text {
                     handle = self.replacement_editor.focus_handle(cx);
                     select_query = false;
                 };
@@ -1058,6 +1066,7 @@ impl BufferSearchBar {
         if self.embedded {
             options.replacement = false;
         }
+        options.replacement &= self.replacement_allowed;
         options
     }
 

@@ -34,6 +34,8 @@ class ExecutionTest(unittest.TestCase):
         self.counts = {"login": 0, "protected": 0, "slow": 0, "create": 0}
         self.authorization = []
         self.posted_bodies = []
+        self.response_body = None
+        self.response_type = "application/json"
         self.lock = threading.Lock()
         fixture = self
 
@@ -49,10 +51,12 @@ class ExecutionTest(unittest.TestCase):
                     time.sleep(3)
                 payload = json.dumps({"Data": {"Token": f"token-{count}"}, "count": count}).encode()
                 self.send_response(200)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", fixture.response_type)
+                self.send_header("Set-Cookie", "first=one")
+                self.send_header("Set-Cookie", "second=two")
                 try:
                     self.end_headers()
-                    self.wfile.write(payload)
+                    self.wfile.write(fixture.response_body if fixture.response_body is not None else payload)
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     pass
 
@@ -98,11 +102,12 @@ class ExecutionTest(unittest.TestCase):
             time.sleep(0.2)
             self.temporary.cleanup()
 
-    def spawn(self, line=6, operation="send", output="body", extra_env=None, extra_args=None, shell=None, shell_initialization=None):
+    def spawn(self, line=6, operation="send", output="body", extra_env=None, extra_args=None, shell=None, shell_initialization=None, interactive=False):
         environment = {**self.environment, "ZED_ROW": str(line), **(extra_env or {})}
         arguments = ["node", "-e", "require(process.env.ZED_CUSTOM_HTTPYAC_EXECUTOR)", "--", operation]
         if operation == "send":
-            arguments += ["--output", output] + (extra_args or [])
+            arguments += ["--output", output]
+        arguments += extra_args or []
         if shell:
             # Match the unquoted shell command assembled from the built-in task template.
             command = 'node -e "require(process.env.ZED_CUSTOM_HTTPYAC_EXECUTOR)" -- ' + " ".join(arguments[4:])
@@ -118,7 +123,7 @@ class ExecutionTest(unittest.TestCase):
         # grandchildren even with stdio=ignore. Capture shell output in files, so waiting
         # for pipe EOF does not falsely wait for the entire worker lifetime.
         files = [open(self.base / ("shell-" + name), "w+b") for name in ("stdout", "stderr")] if shell else None
-        process = subprocess.Popen(arguments, cwd=self.project, env=environment, stdin=subprocess.DEVNULL,
+        process = subprocess.Popen(arguments, cwd=self.project, env=environment, stdin=subprocess.PIPE if interactive else subprocess.DEVNULL,
                                    stdout=files[0] if files else subprocess.PIPE,
                                    stderr=files[1] if files else subprocess.PIPE, text=True, encoding="utf-8")
         process.captured_files = files
@@ -144,6 +149,130 @@ class ExecutionTest(unittest.TestCase):
 
     def records(self):
         return [json.loads(file.read_text()) for file in self.session.glob("*/endpoint.json")]
+
+    def machine_task(self, expected=0, answer=None, **options):
+        process = self.spawn(interactive=True, extra_args=["--json", *options.pop("extra_args", [])], **options)
+        events = []
+        try:
+            for line in process.stdout:
+                self.assertLessEqual(len(line.encode()), 2 * 1024 * 1024)
+                event = json.loads(line)
+                events.append(event)
+                if event["type"] == "prompt":
+                    self.assertIsNotNone(answer)
+                    process.stdin.write(json.dumps({"answer": event["id"], "value": answer}) + "\n")
+                    process.stdin.flush()
+            process.wait(timeout=5)
+            stderr = process.stderr.read()
+            self.assertEqual(process.returncode, expected, stderr + str(events))
+            self.assertEqual(events[-1], {"type": "done", "code": expected})
+            return events
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+
+    def test_structured_responses_reuse_sessions_and_preserve_headers(self):
+        import base64
+        events = self.machine_task()
+        responses = [event for event in events if event["type"] == "response"]
+        self.assertEqual(len(responses), 2)
+        response = responses[-1]
+        self.assertEqual(response["status"], 200)
+        self.assertIn("token-1", response["body"])
+        self.assertIn("first=one", response["headers"])
+        self.assertIn("second=two", response["headers"])
+        self.assertIn("token-1", response["request"])
+        self.assertIn("total", response["timings"])
+        self.assertEqual(len(base64.b64decode(response["rawBody"])), response["bodyBytes"])
+        self.machine_task()
+        self.run_task()
+        self.assertEqual(self.counts["login"], 1)
+        for file in self.session.rglob("*"):
+            if file.is_file() and file.name != "executor.cjs":
+                self.assertNotIn("token-1", file.read_text())
+
+    def test_structured_start_detects_explicit_stream_protocols(self):
+        for request in [
+            "WS ws://127.0.0.1:1/events", "WSS wss://127.0.0.1:1/events",
+            "WEBSOCKET ws://127.0.0.1:1/events", "ws://127.0.0.1:1/events",
+            "wss://127.0.0.1:1/events", f"SSE {self.url}/create",
+            f"EVENTSOURCE {self.url}/create",
+        ]:
+            with self.subTest(request=request):
+                # Exercise the real parser without opening a long-lived connection.
+                self.file.write_text(f"# @disabled\n{request}\n###\nGET {self.url}/create\n", encoding="utf-8")
+                events = self.machine_task(line=2)
+                self.assertEqual(events[0], {"type": "started", "streaming": True})
+                self.assertEqual(sum(event["type"] == "started" for event in events), 1)
+                events = self.machine_task(line=4)
+                self.assertEqual(events[0], {"type": "started", "streaming": False})
+        events = self.machine_task(extra_args=["--all"])
+        self.assertEqual(events[0], {"type": "started", "streaming": True})
+
+    def test_ordinary_http_event_stream_does_not_select_stream_view(self):
+        self.response_type = "text/event-stream"
+        self.response_body = b'data: {"message":"hello"}\n\n'
+        for request in [f"GET {self.url}/create", f'POST {self.url}/create\nContent-Type: application/json\n\n{{}}']:
+            with self.subTest(request=request):
+                self.file.write_text(request + "\n", encoding="utf-8")
+                events = self.machine_task(line=1)
+                self.assertEqual(events[0], {"type": "started", "streaming": False})
+                self.assertTrue(any(event["type"] == "response" for event in events))
+
+    def test_structured_script_output_and_assertions_are_separate(self):
+        self.file.write_text(f'''GET {self.url}/create
+> {{%
+console.log('not JSON: {{"type":"done"}}');
+client.test("intentional failure", function() {{ client.assert(false, "failed assertion"); }});
+%}}
+''', encoding="utf-8")
+        events = self.machine_task(line=1, expected=1)
+        self.assertTrue(any(event["type"] == "output" and "not JSON" in event["text"] for event in events))
+        self.assertTrue(any(event["type"] == "test" and event["status"] in ("FAILED", "ERROR") for event in events))
+        self.assertEqual(sum(event["type"] == "done" for event in events), 1)
+        self.assertEqual(self.counts["create"], 1)
+
+    def test_structured_large_and_binary_responses_are_bounded(self):
+        import base64
+        self.response_body = bytes(range(256)) * 4096
+        self.response_type = "application/octet-stream"
+        events = self.machine_task(line=2)
+        response = next(event for event in events if event["type"] == "response")
+        self.assertTrue(response["truncated"])
+        self.assertEqual(response["bodyBytes"], len(self.response_body))
+        self.assertEqual(base64.b64decode(response["rawBody"]), self.response_body[:512 * 1024])
+
+    def test_structured_prompt_uses_stdin_without_a_terminal(self):
+        self.file.write_text(f'GET {self.url}/protected\nAuthorization: {{{{$password secret}}}}\n', encoding="utf-8")
+        events = self.machine_task(line=1, answer="test-secret")
+        self.assertTrue(any(event["type"] == "prompt" for event in events))
+        self.assertEqual(self.authorization, ["test-secret"])
+
+    def test_structured_send_all_and_reset(self):
+        events = self.machine_task(extra_args=["--all"])
+        self.assertGreaterEqual(sum(event["type"] == "response" for event in events), 5)
+        self.assertEqual(self.counts, {"login": 2, "protected": 2, "slow": 1, "create": 1})
+        self.machine_task(operation="reset", extra_env={"ZED_HTTPYAC_MODULE": "missing"})
+        self.machine_task()
+        self.assertEqual(self.counts["login"], 3)
+
+    def test_structured_disconnect_cancels_without_retry(self):
+        process = self.spawn(line=15, interactive=True, extra_args=["--json"])
+        deadline = time.monotonic() + 10
+        while self.counts["slow"] == 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(self.counts["slow"], 1)
+        process.stdin.close()
+        process.stdin = None
+        process.communicate(timeout=5)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(self.counts["slow"], 1)
+        self.machine_task()
+        self.assertEqual(self.counts["login"], 1)
 
     def test_previous_login_and_ref_are_reused_and_force_ref_refreshes(self):
         self.run_task(line=2)

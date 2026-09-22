@@ -21,6 +21,54 @@ Use the existing HTTP gutter action or Send tasks. A small client connects to a
 long-lived Node worker, which owns `HttpFileStore` and calls `httpyac.send()`.
 Repeated tasks reuse that store; sharing a terminal alone would not suffice.
 
+### Tab-local response view
+
+Built-in Send tasks open a response column inside the invoking HTTP file's tab,
+without creating another pane or tab. The eye button in the editor toolbar and
+`http: toggle response` show/hide it without sending a request. Drag the divider
+to resize; double-click restores equal widths. Switching tabs or hiding the
+column preserves its results and layout. A cloned editor starts without a response
+column. Closing the source editor releases its results and cancels its active run.
+
+The response column provides Raw, Pretty (selected by default), Headers, Request,
+Tests and Log. The status line combines execution status with the selected response's
+HTTP status, body size and duration. Headers retain duplicates; Request displays the
+resolved request, including credentials. Tests and Log apply to the whole run.
+Flat request tabs select the responses produced by Send All or dependencies.
+Explicit WS / SSE requests default to Log when execution starts; Send All does too
+if it contains a WS / SSE request. This uses httpyac's parsed protocol, including
+its WebSocket / EventSource aliases, not the HTTP response's content type.
+Explicit Headers / Request tasks and manual tab choices are preserved; later
+messages never switch tabs automatically. Ordinary HTTP still defaults to Pretty.
+Viewing, searching or exporting
+results never resends requests. JSON Pretty preserves number literals and duplicate
+keys. HTML is shown as source; binary bodies can be exported, not executed.
+
+`Ctrl+F` in the response opens its own read-only search bar. The right-hand toolbar's
+Copy copies the entire current section; Save explicitly writes the retained body bytes to a user-selected
+local path, even for remote requests. Nothing is automatically persisted. The
+source file remains the workspace item, so normal file saving still targets it.
+The response text's context menu preserves the selection and provides Copy (selection
+only), Copy All, Select All and Find Selection. Copy and Find Selection are disabled
+without a selection. Input/password, confirmation and choice prompts appear inside
+the response view.
+
+The first version retains the latest 16 responses of a run, a 128-Ki-character
+text preview and up to 512 KiB of body bytes per response; logs and test output
+retain their latest 256 KiB each. Truncation is indicated, and Save Body is disabled
+if the retained bytes are incomplete. These bounds apply to presentation, not to
+httpyac's own execution cache or network downloads. A new send replaces the tab's
+previous run. Concurrent sends in different tabs share the existing worker queue;
+a second send in a busy tab is rejected until cancelled or completed.
+
+`HTTP: Send request in terminal at line …` preserves the previous terminal workflow.
+Native execution uses the resolved project/task environment plus terminal settings;
+it does not start an interactive shell or evaluate its prompt/profile on every send.
+Configure execution variables through project/task/terminal environment settings
+rather than relying on per-command interactive-shell side effects. Remote execution
+uses the existing transport's non-TTY command support; Node and httpyac still run
+on the remote host. Collaboration guest execution is not supported.
+
 ```http
 # @name ReqA
 GET https://example.com/login
@@ -85,10 +133,13 @@ workers. Requests in a worker are serialized, including simultaneous first click
   HTTP 401, or interrupted request. The only internal reconnect is an explicit
   preflight restart response, before any script/request has begun. Token expiry
   is not inferred: send the login request, use `@forceRef`, or reset explicitly.
-- Responses and script output go to the task terminal. Interactive prompts use
-  that terminal, with masked password input; there is no daemon response log.
-  Client disconnect cancels the active worker. Long-lived streams occupy its
-  queue until canceled or reset.
+- Native tasks carry structured response, log, test and prompt events over piped
+  stdio; the existing worker IPC remains authenticated. Terminal fallback still
+  formats results and prompts in the terminal. There is no daemon response log.
+  Client disconnect cancels the active worker. Native clients also require GUI
+  heartbeats, so a broken remote pipe cannot leave a hidden request waiting forever.
+  Long-lived streams occupy the worker queue until canceled or reset. Cancellation
+  can discard shared worker state, not just the contents of one response column.
 - IPC listens only on loopback and requires a per-worker random secret stored
   inside a private session subdirectory. Requests/paths are passed as JSON or
   environment values, never interpolated into shell command text.
@@ -102,6 +153,8 @@ npm install --prefix target/httpyac-executor-test --ignore-scripts --no-audit --
 python crates/languages/tests/test_http_executor.py target/httpyac-executor-test/node_modules/httpyac
 cargo check -p languages -p zed -p remote_server
 cargo test -p languages http::tests::request_tasks_use_the_persistent_executor
+cargo test -p http_ui
+ITERATIONS=20 cargo test -p http_ui
 ```
 
 Python tests use a loopback-only HTTP fixture and temporary projects. They cover
@@ -114,4 +167,9 @@ assertion failures, and actual shell commands with Unicode/spaces/quotes in
 paths. On Windows they exercise cmd and PowerShell (plus pwsh if installed);
 on Linux, sh and bash. Regression tests generate a new Starship session key in
 each fresh shell and vary terminal/SSH metadata while asserting a single worker
-and a single dependency request. No external request endpoint is used.
+and a single dependency request. Structured-mode tests also cover duplicate headers,
+raw bytes, large/binary response bounds, script/response separation, assertions,
+password prompts over stdin, Send All, reset, and disconnect cancellation. GPUI
+tests cover editor-local ownership, source focus, local response search, hiding and
+reopening, bounded results, prompt cleanup, and native-task source routing and
+preflight errors. No external request endpoint is used.

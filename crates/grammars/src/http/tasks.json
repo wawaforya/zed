@@ -1,6 +1,7 @@
 [
   {
     "label": "HTTP: $ZED_CUSTOM_method $ZED_CUSTOM_url",
+    "env": { "ZED_HTTPYAC_UI": "1" },
     "command": "node",
     "args": [
       "-e",
@@ -20,6 +21,7 @@
   },
   {
     "label": "HTTP: $ZED_CUSTOM_name — $ZED_CUSTOM_method $ZED_CUSTOM_url",
+    "env": { "ZED_HTTPYAC_UI": "1" },
     "command": "node",
     "args": [
       "-e",
@@ -39,6 +41,7 @@
   },
   {
     "label": "HTTP: Send request headers at line $ZED_ROW",
+    "env": { "ZED_HTTPYAC_UI": "1" },
     "command": "node",
     "args": [
       "-e",
@@ -57,6 +60,7 @@
   },
   {
     "label": "HTTP: Send request body at line $ZED_ROW",
+    "env": { "ZED_HTTPYAC_UI": "1" },
     "command": "node",
     "args": [
       "-e",
@@ -75,6 +79,7 @@
   },
   {
     "label": "HTTP: Send request exchange at line $ZED_ROW",
+    "env": { "ZED_HTTPYAC_UI": "1" },
     "command": "node",
     "args": [
       "-e",
@@ -93,6 +98,7 @@
   },
   {
     "label": "HTTP: Send all requests in $ZED_FILENAME",
+    "env": { "ZED_HTTPYAC_UI": "1" },
     "command": "node",
     "args": [
       "-e",
@@ -112,6 +118,7 @@
   },
   {
     "label": "HTTP: Reset execution sessions for this project",
+    "env": { "ZED_HTTPYAC_UI": "1" },
     "command": "node",
     "args": [
       "-e",
@@ -121,6 +128,18 @@
     ],
     "cwd": "$ZED_WORKTREE_ROOT",
     "save": "none",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always",
+    "hide": "never"
+  },
+  {
+    "label": "HTTP: Send request in terminal at line $ZED_ROW",
+    "command": "node",
+    "args": ["-e", "\"require(process.env.ZED_CUSTOM_HTTPYAC_EXECUTOR)\"", "--", "send", "--output", "response"],
+    "env": { "ZED_HTTPYAC_UI": "0" },
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "save": "current",
     "use_new_terminal": false,
     "allow_concurrent_runs": false,
     "reveal": "always",
