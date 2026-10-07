@@ -367,7 +367,7 @@ impl Editor {
         let buffer_id = buffer.read(cx).remote_id();
         let editor = cx.weak_entity();
         let reveal_strategy = action.reveal;
-        let task_context = Self::build_tasks_context(&project, &buffer, buffer_row, &tasks, cx);
+        let task_context = self.build_tasks_context(&project, &buffer, buffer_row, &tasks, cx);
         cx.spawn_in(window, async move |_, cx| {
             let context = task_context.await.ok().flatten()?;
             let (task_source_kind, mut resolved_task) = tasks.resolve(&context).next()?;
@@ -518,6 +518,18 @@ impl Editor {
             let buffer = location.buffer.read(cx);
             let buffer_id = buffer.remote_id();
             let snapshot = buffer.snapshot();
+            for addon in self.addons.values() {
+                addon.extend_task_variables(&mut variables, cx);
+            }
+            if buffer
+                .language()
+                .is_some_and(|language| language.name().as_ref() == "HTTP")
+            {
+                variables.insert(
+                    VariableName::Custom("HTTP_SOURCE_VERSION".into()),
+                    format!("{:?}", buffer.version()),
+                );
+            }
             let starting_point = location.range.start.to_point(&snapshot);
             let starting_offset = starting_point.to_offset(&snapshot);
             for (_, tasks) in self
