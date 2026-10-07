@@ -1,0 +1,148 @@
+=========
+XML body with json inside
+=========
+
+POST example.com
+
+<?xml version="1.0" encoding="utf-8"?>
+{
+  "foo": "bar"
+}
+
+---
+
+(document
+  (section
+    request: (request
+      method: (method)
+      url: (target_url)
+      body: (xml_body))))
+
+=========
+Raw body wrapped with annotation comments
+=========
+
+POST example.com
+
+# @_RES
+raw body
+# @_END
+
+---
+
+(document
+  (section
+    request: (request
+      method: (method)
+      url: (target_url)
+      (metadata
+        (generic_metadata
+          name: (identifier)))
+      body: (raw_body)
+      (metadata
+        (generic_metadata
+          name: (identifier))))))
+
+=========
+JSON body wrapped with annotation comments
+=========
+
+POST example.com
+
+# @_RES
+{
+  "foo": "bar"
+}
+# @_END
+
+---
+
+(document
+  (section
+    request: (request
+      method: (method)
+      url: (target_url)
+      (metadata
+        (generic_metadata
+          name: (identifier)))
+      body: (json_body)
+      (metadata
+        (generic_metadata
+          name: (identifier))))))
+
+=========
+Request with multiple external bodies
+=========
+
+POST example.com
+
+< path/to/file
+
+
+< path/to/file
+
+---
+
+(document
+  (section
+    request: (request
+      method: (method)
+      url: (target_url)
+      body: (external_body
+        path: (path))
+      body: (external_body
+        path: (path)))))
+
+=============================================
+JSON line comment does not swallow next request
+=============================================
+
+POST https://example.com/login
+Content-Type: application/json
+
+{
+  // retained in the source, stripped before sending
+  "access_token": "demo-token"
+}
+
+> {%
+client.global.set("accessToken", response.body.access_token);
+%}
+
+### Consume token
+# @ref login
+POST https://example.com/consume
+Content-Type: application/json
+
+{
+  "value": "ok"
+}
+
+---
+
+(document
+  (section
+    request: (request
+      method: (method)
+      url: (target_url)
+      header: (header
+        name: (header_entity)
+        value: (value))
+      body: (json_body)
+      (res_handler_script
+        (script
+          body: (script_body)))))
+  (section
+    (request_separator
+      value: (value))
+    (metadata
+      (ref_metadata
+        name: (metadata_key)
+        value: (value)))
+    request: (request
+      method: (method)
+      url: (target_url)
+      header: (header
+        name: (header_entity)
+        value: (value))
+      body: (json_body))))

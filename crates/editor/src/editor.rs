@@ -821,9 +821,15 @@ impl BufferSerialization {
 
 /// Addons allow storing per-editor state in other crates (e.g. Vim)
 pub trait Addon: 'static {
+    fn focus_handle(&self, _cx: &App) -> Option<FocusHandle> {
+        None
+    }
+
     fn render_editor(&self, editor: AnyElement, _window: &mut Window, _cx: &App) -> AnyElement {
         editor
     }
+
+    fn extend_task_variables(&self, _: &mut task::TaskVariables, _: &App) {}
 
     fn extend_key_context(&self, _: &mut KeyContext, _: &App) {}
 
@@ -4897,6 +4903,7 @@ impl Editor {
     }
 
     fn build_tasks_context(
+        &self,
         project: &Entity<Project>,
         buffer: &Entity<Buffer>,
         buffer_row: u32,
@@ -4911,6 +4918,29 @@ impl Editor {
         };
         // Fill in the environmental variables from the tree-sitter captures
         let mut captured_task_variables = TaskVariables::default();
+        if buffer
+            .read(cx)
+            .language()
+            .is_some_and(|language| language.name().as_ref() == "HTTP")
+        {
+            captured_task_variables.insert(
+                task::VariableName::Custom("SOURCE_EDITOR".into()),
+                cx.entity_id().as_u64().to_string(),
+            );
+        }
+        for addon in self.addons.values() {
+            addon.extend_task_variables(&mut captured_task_variables, cx);
+        }
+        if buffer
+            .read(cx)
+            .language()
+            .is_some_and(|language| language.name().as_ref() == "HTTP")
+        {
+            captured_task_variables.insert(
+                task::VariableName::Custom("HTTP_SOURCE_VERSION".into()),
+                format!("{:?}", buffer.read(cx).version()),
+            );
+        }
         for (capture_name, value) in tasks.extra_variables.clone() {
             captured_task_variables.insert(
                 task::VariableName::Custom(capture_name.into()),
@@ -12735,8 +12765,11 @@ pub enum EditorEvent {
 impl EventEmitter<EditorEvent> for Editor {}
 
 impl Focusable for Editor {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.addons
+            .values()
+            .find_map(|addon| addon.focus_handle(cx))
+            .unwrap_or_else(|| self.focus_handle.clone())
     }
 }
 

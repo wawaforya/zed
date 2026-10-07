@@ -1,0 +1,17 @@
+name = "HTTP"
+grammar = "httpyac"
+path_suffixes = ["http", "rest"]
+line_comments = ["# ", "// "]
+tab_size = 2
+hard_tabs = false
+word_characters = ["@", "$", "-"]
+
+[overrides.http_completion]
+completion_query_characters = ["-", ".", "/", ":", "?", "&", "=", "{", "@", "$"]
+
+brackets = [
+  { start = "\"", end = "\"", close = true, newline = false },
+  { start = "{", end = "}", close = true, newline = true },
+  { start = "[", end = "]", close = true, newline = true },
+  { start = "(", end = ")", close = true, newline = false },
+]
