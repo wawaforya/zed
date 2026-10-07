@@ -199,6 +199,14 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
 static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
 
 fn main() {
+    if let Some(result) = httpyac_lsp::run_if_requested() {
+        if let Err(error) = result {
+            eprintln!("HTTP language server failed: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     STARTUP_TIME.get_or_init(|| Instant::now());
 
     // If this process was re-executed as a Linux sandbox helper, run that mode
@@ -778,6 +786,7 @@ fn main() {
         git_ui::init(cx);
         feedback::init(cx);
         markdown_preview::init(cx);
+        http_ui::init(cx);
         tabular_data_preview::init(cx);
         svg_preview::init(cx);
         onboarding::init(cx);

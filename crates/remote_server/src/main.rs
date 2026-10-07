@@ -22,6 +22,10 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
+    if let Some(result) = httpyac_lsp::run_if_requested() {
+        return result;
+    }
+
     let cli = Cli::parse();
 
     if let Some(socket_path) = &cli.askpass {

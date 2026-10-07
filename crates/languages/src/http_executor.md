@@ -1,0 +1,306 @@
+# Built-in HTTP execution sessions
+
+HTTP gutter actions and built-in tasks use `http_executor.cjs`, embedded by
+`http.rs` into Zed and the remote server. Building either binary needs no npm
+step. The context provider materializes the bridge in a process-owned temporary
+directory; it does not load httpyac or run project code. For remote projects,
+context construction, the bridge, Node, httpyac, and requests all run remotely.
+The Rust HTTP language server remains independent and static-only.
+
+## Requirements and use
+
+Install Node and httpyac **on the machine executing the tasks**. Both must be
+available in the project's terminal environment. The bridge supports httpyac
+6.x and is tested against 6.16.7. It finds the package behind `httpyac` on PATH
+(including npm global Windows launchers and Unix symlinks), then project and
+standard global Node module locations. Nonstandard launchers/installations can
+set `ZED_HTTPYAC_MODULE` to the absolute directory containing httpyac's
+`package.json`. It does not download or install dependencies automatically.
+
+Use the existing HTTP gutter action or Send tasks. A small client connects to a
+long-lived Node worker, which owns `HttpFileStore` and calls `httpyac.send()`.
+Repeated tasks reuse that store; sharing a terminal alone would not suffice.
+
+### Text and Requests views
+
+HTTP tabs have a Text / Requests switch (also `http: toggle view`). Both views edit
+the same source buffer and save the same file. Text keeps the full-file editor and
+optional response column. Requests uses a resizable request tree (initially 20%)
+on the left and a request editor above the response on the right. Switching views,
+requests, groups, sorting or environments never sends a request. Layout and request
+selection are tab-local. Environment selections are remembered per project/worktree/file
+for this Zed session, survive closing and reopening the file, and are shared by
+multiple views of that file. They are not written to settings or the HTTP file.
+
+The request editor is an editable excerpt of the original buffer, including the
+request's metadata, scripts and assertions, not a copied scratch document. The
+File context entry shows standalone non-request regions (for example a variables
+block before `###`). Add new regions in Text view. Ctrl+F in the request editor
+searches that excerpt; Ctrl+F in the response searches only response text.
+
+By default `@name admin__users__02_list` creates nested `admin / users` groups and
+a `02_list` leaf. Ordinary single underscores are preserved. View options also
+support grouping at the first underscore or explicit groups only. A plain comment
+`# zed-group: 01_Administration/Users` overrides name-based grouping; this is a
+Zed presentation convention, not an httpyac directive. `@title` overrides the leaf
+label without renaming the `@name` used by references. An unnamed request can use
+its `###` title, otherwise its method and URL. Ungrouped requests appear last.
+Filtering matches names, titles, methods, group paths and URLs, expanding matching
+ancestors without changing their saved collapsed state.
+
+Groups and requests use natural name order (`2` before `10`), with file position
+as the stable tie-breaker. File-order mode preserves first-occurrence order within
+the group tree. Sorting changes only presentation: Send All still uses httpyac's
+file/dependency order. Clicking a row selects it; use Send or Send All explicitly.
+
+### Environments
+
+The Env menu in either view selects an override for that file. Inherit configuration
+resolves the project environment and terminal settings' `ZED_HTTPYAC_ENV` when the
+file opens and when settings change, without requiring a request to be sent. No named environment clears the
+named selection but still applies `$shared`. Discovery reads `http-client.env.json`
+and `http-client.private.env.json` from the source directory through the worktree root,
+and both files in the worktree root's `.zed` directory, via the project buffer API
+including remote projects. It never runs configuration JavaScript, plugins or requests.
+Refresh rescans files. Open entries edit existing configuration or create the default
+`.zed/http-client.env.json`. Save edited environment buffers before native execution;
+otherwise Send reports an error.
+
+Environment objects are merged by variable name, with later values replacing earlier
+ones (object-valued variables are replaced, not deeply merged). Public files retain
+httpyac's ordering, followed by `.zed/http-client.env.json`; private files then overlay
+those values, followed by `.zed/http-client.private.env.json`. Thus `.zed` wins over the
+same filename outside `.zed`, while private files always override public files.
+`$shared` is merged first, followed by the selected named environments in order. It is
+not listed as a selectable environment. Creating, editing or deleting an environment
+file invalidates the execution session before the next send.
+
+For example, put this in `http-client.env.json`:
+
+```json
+{
+  "$shared": { "baseUrl": "http://localhost:8080" },
+  "dev": {},
+  "test": { "baseUrl": "https://test.example.com" }
+}
+```
+
+Then use `GET {{baseUrl}}/users` without same-name file-local overrides. The menu
+also accepts a manually entered environment name, comma-separated ordered overlays,
+or a JSON string array for environments supplied by other httpyac configuration.
+Other variable providers, file variables, scripts and responses retain httpyac's
+existing precedence. Discovery does not evaluate `.httpyac.js` or infer names from
+arbitrary scripts. Keep credentials in private/ignored configuration or process
+environment, not shared settings.
+
+The HTTP LSP receives the file's effective environment selection, including ordered
+overlays, and analyzes `$shared` plus only those environments. Selections are replayed
+after LSP restarts. Saved JSON changes refresh diagnostics and completion; unsaved JSON
+buffers are not sent to the HTTP LSP. Completion shows names and environment labels,
+never private values. Task-specific environment overrides can differ from the editor's
+selection; native execution reports that difference without changing the remembered
+selection or retargeting LSP analysis. Dynamic script/plugin environments remain
+runtime-only.
+
+The environment is captured when a task is invoked, including gutter actions and
+the terminal fallback. Changing the menu while preparation/execution is pending
+cannot retarget that run. Different environment selections retain the existing
+isolated workers and sessions. Responses show the execution environment; selecting
+another environment never presents a previous environment's result as its own.
+
+### Tab-local response view
+
+Built-in Send tasks open a response column inside the invoking HTTP file's tab,
+without creating another pane or tab. The eye button in the editor toolbar and
+`http: toggle response` show/hide it without sending a request. Drag the divider
+to resize; double-click restores equal widths. Switching tabs or hiding the
+column preserves its results and layout. In Requests view the response is below
+the excerpt; the eye button (Toggle Response) can hide/show it independently. A cloned
+editor starts without results or a visible response column. Closing the source
+editor releases its results and cancels its active run.
+
+The response column provides Raw, Pretty (selected by default), Headers, Request,
+Tests and Log. The status line combines execution status with the selected response's
+HTTP status, body size and duration. Headers retain duplicates; Request displays the
+resolved request, including credentials. Tests and Log apply to the whole run.
+Flat request tabs select the responses produced by Send All or dependencies.
+Explicit WS / SSE requests default to Log when execution starts; Send All does too
+if it contains a WS / SSE request. This uses httpyac's parsed protocol, including
+its WebSocket / EventSource aliases, not the HTTP response's content type.
+Explicit Headers / Request tasks and manual tab choices are preserved; later
+messages never switch tabs automatically. Ordinary HTTP still defaults to Pretty.
+Viewing, searching or exporting
+results never resends requests. Raw shows the complete decoded text without syntax
+highlighting or formatting. Pretty keeps a bounded, syntax-highlighted preview;
+JSON Pretty preserves number literals and duplicate keys. HTML is shown as source;
+binary bodies show an export hint and can be saved, not executed.
+
+`Ctrl+F` in the response opens its own read-only search bar. The right-hand toolbar's
+Copy copies the entire current section; Save explicitly writes the retained body bytes to a user-selected
+local path, even for remote requests. Nothing is automatically persisted. The
+source file remains the workspace item, so normal file saving still targets it.
+The response text's context menu preserves the selection and provides Copy (selection
+only), Copy All, Select All and Find Selection. Copy and Find Selection are disabled
+without a selection. Input/password, confirmation and choice prompts appear inside
+the response view.
+
+The view retains the latest 16 responses of a run, including their complete decoded
+text and body bytes in memory. Raw, its Copy/Find actions, and Save have no fixed
+body-length cutoff (available memory still limits response size). Pretty retains a
+128-Ki-UTF-16-code-unit preview; its truncation indicator applies only to Pretty,
+not to the complete Raw body. Logs and test output retain their latest 256 KiB each.
+These bounds do not limit httpyac's own execution cache or network downloads.
+Recent runs are retained per
+request and environment (up to eight runs, with a 16-MiB retained-response budget;
+the active and currently displayed run are protected from eviction). A repeated
+send replaces that request/environment's previous direct run. Send All and dependency
+responses are associated by source document and request line captured for that run,
+not by potentially duplicated names. Imported responses remain accessible in the
+run's response tabs; Tests and Log always describe the whole run. Editing source or
+loaded environment configuration marks retained results as old; it does not resend.
+These UI records are separate from httpyac's execution cache and are never persisted.
+
+You can select B while A runs; completion does not change the selected request.
+The toolbar Cancel still targets the active run even when its response is hidden.
+Concurrent sends in different tabs share the existing worker queue; a second send
+in a busy tab is rejected until cancelled or completed. If the source changes while
+a native task is being prepared/saved, the task fails rather than sending a different
+request at a stale line number. Send again explicitly.
+
+`HTTP: Send request in terminal at line …` preserves the previous terminal workflow.
+Native execution uses the resolved project/task environment plus terminal settings;
+it does not start an interactive shell or evaluate its prompt/profile on every send.
+Configure execution variables through project/task/terminal environment settings
+rather than relying on per-command interactive-shell side effects. Remote execution
+uses the existing transport's non-TTY command support; Node and httpyac still run
+on the remote host. Collaboration guest execution is not supported.
+
+```http
+# @name ReqA
+GET https://example.com/login
+
+###
+# @ref ReqA
+GET https://example.com/data
+Authorization: Bearer {{ReqA.Data.Token}}
+```
+
+Sending the second request repeatedly executes `ReqA` only when its result is
+missing. `# @forceRef ReqA` refreshes it every time. Explicitly sending `ReqA`
+also refreshes it. A bare `{{ReqA.Data.Token}}` can consume a previous result but
+does not itself execute `ReqA`; use `@ref` for that dependency.
+
+`HTTP: Reset execution sessions for this project` discards all environment
+variants, including cookies and user sessions. It also interrupts active
+requests; an interrupted request may already have reached the server.
+
+Set `ZED_HTTPYAC_ENV=dev` (or `dev,local`, or a JSON string array) in the project
+terminal environment/task env to select httpyac environments. Environment
+ordering is retained. Projects, environment selections, different installed
+engine versions, and changed process environment values have separate workers.
+Per-shell/terminal metadata (including `STARSHIP_SESSION_KEY`, terminal IDs and
+sizes, and `SSH_CLIENT`/`SSH_CONNECTION`/`SSH_TTY`) is excluded from the session
+key, so a fresh task shell does not lose cached responses. This is an explicit
+list, not a blanket exclusion of `SSH_*` or `STARSHIP_*`: credentials and
+configuration such as `SSH_AUTH_SOCK` and `STARSHIP_CONFIG` still partition
+workers. Requests in a worker are serialized, including simultaneous first clicks.
+
+## Invalidation and safety
+
+- State is in memory, not an on-disk response/token cache. The temporary IPC
+  descriptor contains a loopback port, random authentication token, and owner
+  information, not request results. Project scripts/configuration still have
+  their usual httpyac permissions and may explicitly persist their own data.
+- At the next send, changed HTTP documents (including previously imported files)
+  are reparsed through httpyac's `HttpFileStore`. Like the VS Code integration,
+  request blocks with identical parsed source keep their variables. Editing B's
+  body/headers does not discard an unchanged A's result. Editing a block's own
+  source, including comments, can invalidate its cached result.
+- Editing/removing/renaming a named request also invalidates copied `@ref`
+  variables and cached results referencing that name, transitively. Imported
+  files are refreshed before assembling execution variables, so old values in
+  the importing file cannot hide a changed dependency.
+- Changes to global regions or blocks containing scripts/variable declarations
+  conservatively clear all cached region variables and user sessions. Such code
+  can affect other requests without an explicit named dependency. Arbitrary
+  computed script/plugin dependencies cannot all be inferred; reset manually
+  when a dependency is not expressed through named references.
+- Changes to external body files, environment/config files, consulted non-HTTP
+  files, and loaded project JS modules still restart the worker before sending.
+  A file used both as an HTTP document and an external body is treated as an
+  external input. Arbitrary filesystem access inside third-party plugins/scripts
+  cannot all be tracked; reset manually after such changes.
+- A new/modified input does not itself execute anything. Only an explicit Send
+  task starts httpyac, project configuration, plugins, scripts, or requests.
+- Workers stop when their Zed/remote-server owner exits, when the temporary
+  directory disappears, or after 30 minutes idle. A failed or canceled execution
+  also discards its worker to avoid reusing partially modified state.
+- There is no automatic retry after a connection failure, failed assertion,
+  HTTP 401, or interrupted request. The only internal reconnect is an explicit
+  preflight restart response, before any script/request has begun. Token expiry
+  is not inferred: send the login request, use `@forceRef`, or reset explicitly.
+- Native tasks carry structured response, log, test and prompt events over piped
+  stdio; the existing worker IPC remains authenticated. Terminal fallback still
+  formats results and prompts in the terminal. There is no daemon response log.
+  Client disconnect cancels the active worker. Native clients also require GUI
+  heartbeats, so a broken remote pipe cannot leave a hidden request waiting forever.
+  Long-lived streams occupy the worker queue until canceled or reset. Cancellation
+  can discard shared worker state, not just the contents of one response column.
+- IPC listens only on loopback and requires a per-worker random secret stored
+  inside a private session subdirectory. Requests/paths are passed as JSON or
+  environment values, never interpolated into shell command text.
+
+## Response transfer protocol
+
+Structured responses use `response-start` (a unique `id`, response metadata/Pretty
+preview, and `textBytes` for the complete decoded UTF-8 text), `response-chunk`
+(the same `id`, decoded `text`, and base64 `data`), then `response-end` (`id`).
+Both chunk fields may be empty. Byte chunks are 48 KiB except for the final chunk,
+so only the final nonempty base64 chunk may contain padding. Text chunks are at
+most 48 Ki UTF-16 code units and never split a surrogate pair. Binary responses
+transfer an export hint as text and all original body bytes as data.
+
+The worker awaits each frame's write to honor backpressure, and the client pauses
+its socket when GUI/remote stdout is full. The existing 2-MiB per-frame limits stay
+in place; the assembled body has no fixed size limit. Rust assembles chunks on the
+background executor, checking response IDs, decoded byte counts and text lengths,
+and publishes the response only after its end event. Interleaved log/test/prompt
+events remain usable. Disconnects, premature completion and invalid chunks fail
+the run rather than exposing a partial body as a complete response. No temporary
+body files or local-only paths are used, including for remote requests.
+
+## Tests
+
+Install test dependencies only into a disposable directory, then run:
+
+```sh
+npm install --prefix target/httpyac-executor-test --ignore-scripts --no-audit --no-fund httpyac@6.16.7
+python crates/languages/tests/test_http_executor.py target/httpyac-executor-test/node_modules/httpyac
+cargo check -p languages -p zed -p remote_server
+cargo test -p languages http::tests::request_tasks_use_the_persistent_executor
+cargo test -p http_ui
+ITERATIONS=20 cargo test -p http_ui
+```
+
+Python tests use a loopback-only HTTP fixture and temporary projects. They cover
+cached references, body/header edits preserving dependencies, transitive
+invalidation, global variable/script edits, request deletion/rename, imported
+file edits, explicit/forced refresh, direct variable reuse, imports,
+input/config/environment invalidation, concurrent starts, project isolation,
+reset, cancellation, owner exit, authentication, output modes, scripts,
+assertion failures, and actual shell commands with Unicode/spaces/quotes in
+paths. On Windows they exercise cmd and PowerShell (plus pwsh if installed);
+on Linux, sh and bash. Regression tests generate a new Starship session key in
+each fresh shell and vary terminal/SSH metadata while asserting a single worker
+and a single dependency request. Structured-mode tests also cover duplicate headers,
+complete raw bytes, bounded Pretty previews, large/empty/binary responses, Unicode
+chunk boundaries, slow consumers, script/response separation, assertions,
+password prompts over stdin, Send All, reset, and disconnect cancellation. GPUI
+tests cover editor-local ownership, source focus, local response search, hiding and
+reopening, bounded results, prompt cleanup, and native-task source routing and
+preflight errors, complete plain-text Raw search/copy, Raw/Pretty language switching,
+and valid/incomplete response transfers. Workbench tests additionally cover shared-buffer edits and undo,
+request identity, grouping/natural ordering, environment discovery without execution,
+queued environment snapshots, per-request/environment histories, Send All origin
+mapping, local excerpt search, layout hiding, eviction and source-owned cancellation.
+No external request endpoint is used.
