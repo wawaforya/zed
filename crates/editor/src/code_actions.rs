@@ -68,7 +68,7 @@ impl Editor {
                     && let Some(project) = project
                 {
                     task_context_task =
-                        Self::build_tasks_context(&project, &buffer, buffer_row, tasks, cx);
+                        self.build_tasks_context(&project, &buffer, buffer_row, tasks, cx);
                 }
 
                 cx.spawn_in(window, {
