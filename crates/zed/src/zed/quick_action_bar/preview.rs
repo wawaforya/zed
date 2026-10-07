@@ -21,6 +21,22 @@ impl QuickActionBar {
         let active_item = self.active_item.as_ref()?;
         let editor = active_item.act_as::<Editor>(cx);
 
+        if let Some(editor) = &editor
+            && http_ui::is_http_editor(editor, cx)
+        {
+            let editor = editor.clone();
+            return Some(
+                IconButton::new("toggle-http-response", IconName::Eye)
+                    .icon_size(IconSize::Small)
+                    .style(ButtonStyle::Subtle)
+                    .tooltip(|_, cx| Tooltip::for_action("Toggle HTTP Response", &http_ui::ToggleResponse, cx))
+                    .on_click(move |_, window, cx| {
+                        http_ui::toggle_response(editor.clone(), window, cx);
+                    })
+                    .into_any_element(),
+            );
+        }
+
         let preview_target = if let Some(editor) = &editor
             && MarkdownPreviewView::is_markdown_file(editor, cx)
         {

@@ -25,6 +25,35 @@ pub enum ScheduledTaskResult {
 
 type TaskCompletionHandler = Box<dyn FnOnce(ScheduledTaskResult, &mut AsyncWindowContext)>;
 
+type NativeTaskCallback = dyn Fn(
+    &mut Workspace,
+    &SpawnInTerminal,
+    &mut Window,
+    &mut Context<Workspace>,
+) -> Option<Task<ScheduledTaskResult>>;
+
+#[derive(Default)]
+struct NativeTaskRunners(Vec<std::rc::Rc<NativeTaskCallback>>);
+
+impl gpui::Global for NativeTaskRunners {}
+
+pub fn register_native_task_runner(
+    runner: impl Fn(
+        &mut Workspace,
+        &SpawnInTerminal,
+        &mut Window,
+        &mut Context<Workspace>,
+    ) -> Option<Task<ScheduledTaskResult>> + 'static,
+    cx: &mut gpui::App,
+) {
+    if !cx.has_global::<NativeTaskRunners>() {
+        cx.set_global(NativeTaskRunners::default());
+    }
+    cx.global_mut::<NativeTaskRunners>()
+        .0
+        .push(std::rc::Rc::new(runner));
+}
+
 impl Workspace {
     pub fn schedule_task(
         self: &mut Workspace,
@@ -122,6 +151,23 @@ impl Workspace {
                     })
                 }
             });
+        }
+
+        let runners = cx
+            .try_global::<NativeTaskRunners>()
+            .map(|runners| runners.0.clone())
+            .unwrap_or_default();
+        for runner in runners {
+            if let Some(task) = runner(self, &spawn_in_terminal, window, cx) {
+                cx.spawn_in(window, async move |_, cx| {
+                    let result = task.await;
+                    if let Some(on_complete) = on_complete {
+                        on_complete(result, cx);
+                    }
+                })
+                .detach();
+                return;
+            }
         }
 
         if self.terminal_provider.is_some() {
