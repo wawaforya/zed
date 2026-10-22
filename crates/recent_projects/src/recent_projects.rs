@@ -1258,7 +1258,47 @@ impl PickerDelegate for RecentProjectsDelegate {
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
-        match self.filtered_entries.get(ix)? {
+        let entry = self.filtered_entries.get(ix)?;
+        let remote_name = if self.style == ProjectPickerStyle::Popover {
+            let connection_options = match entry {
+                ProjectPickerEntry::Header(_) => None,
+                ProjectPickerEntry::OpenFolder { index, .. } => {
+                    self.open_folders.get(*index)?.connection_options.clone()
+                }
+                ProjectPickerEntry::ProjectGroup(hit) => {
+                    self.window_project_groups.get(hit.candidate_id)?.host()
+                }
+                ProjectPickerEntry::RecentProject(hit) => {
+                    match &self.workspaces.get(hit.candidate_id)?.location {
+                        SerializedWorkspaceLocation::Local => None,
+                        SerializedWorkspaceLocation::Remote(options) => Some(options.clone()),
+                    }
+                }
+            };
+            connection_options.map(|options| {
+                remote_project_name(
+                    options,
+                    cx.global::<settings::SettingsStore>()
+                        .merged_settings()
+                        .remote
+                        .ssh_connections
+                        .as_deref()
+                        .unwrap_or_default(),
+                )
+            })
+        } else {
+            None
+        };
+        let remote_label = remote_name.clone().map(|name| {
+            div().min_w_0().max_w_48().child(
+                Label::new(name)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .truncate(),
+            )
+        });
+
+        match entry {
             ProjectPickerEntry::Header(title) => Some(
                 v_flex()
                     .w_full()
@@ -1307,7 +1347,11 @@ impl PickerDelegate for RecentProjectsDelegate {
                 let icon = icon_for_remote_connection(folder.connection_options.as_ref());
                 let show_icon = self.filtered_entries_include_remote_project();
 
-                let tooltip_path: SharedString = path.to_string_lossy().to_string().into();
+                let tooltip_path: SharedString = if let Some(host) = remote_name {
+                    format!("{} ({})", path.to_string_lossy(), host).into()
+                } else {
+                    path.to_string_lossy().to_string().into()
+                };
                 let tooltip_branch = branch.clone();
 
                 Some(
@@ -1327,13 +1371,20 @@ impl PickerDelegate for RecentProjectsDelegate {
                                 .child(
                                     v_flex()
                                         .min_w_0()
+                                        .when(!show_path, |this| this.flex_1())
                                         .child(
                                             h_flex()
                                                 .gap_1()
-                                                .child(HighlightedLabel::new(
-                                                    name.to_string(),
-                                                    positions,
-                                                ))
+                                                .when(!show_path, |this| this.min_w_0().w_full())
+                                                .child(
+                                                    HighlightedLabel::new(
+                                                        name.to_string(),
+                                                        positions,
+                                                    )
+                                                    .when(!show_path, |this| {
+                                                        this.single_line().truncate()
+                                                    }),
+                                                )
                                                 .when_some(branch, |this, branch| {
                                                     this.child(
                                                         Label::new(branch)
@@ -1357,6 +1408,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                                             )
                                         }),
                                 )
+                                .children(remote_label)
                                 .when(!show_path, |this| {
                                     this.tooltip(move |_, cx| {
                                         if let Some(branch) = tooltip_branch.clone() {
@@ -1385,7 +1437,11 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .ordered_paths()
                     .map(|p| p.compact().to_string_lossy().to_string())
                     .collect();
-                let tooltip_path: SharedString = ordered_paths.join("\n").into();
+                let tooltip_path: SharedString = if let Some(host) = remote_name {
+                    format!("{}\n({})", ordered_paths.join("\n"), host).into()
+                } else {
+                    ordered_paths.join("\n").into()
+                };
                 let icon = icon_for_project_group(key);
                 let show_icon = self.filtered_entries_include_remote_project();
 
@@ -1492,8 +1548,14 @@ impl PickerDelegate for RecentProjectsDelegate {
                                     if !self.render_paths {
                                         highlighted.paths.clear();
                                     }
-                                    highlighted.render(window, cx)
+                                    let label = highlighted.render(window, cx);
+                                    if self.style == ProjectPickerStyle::Popover {
+                                        div().min_w_0().flex_1().child(label).into_any_element()
+                                    } else {
+                                        label.into_any_element()
+                                    }
                                 })
+                                .children(remote_label)
                                 .tooltip(Tooltip::text(tooltip_path)),
                         )
                         .end_slot(secondary_actions)
@@ -1514,7 +1576,9 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .collect();
                 let tooltip_path: SharedString = match &location {
                     SerializedWorkspaceLocation::Remote(options) => {
-                        let host = options.display_name();
+                        let host = remote_name
+                            .clone()
+                            .unwrap_or_else(|| options.display_name());
                         if ordered_paths.len() == 1 {
                             format!("{} ({})", ordered_paths[0], host).into()
                         } else {
@@ -1543,7 +1607,9 @@ impl PickerDelegate for RecentProjectsDelegate {
                 };
 
                 let prefix = match &location {
-                    SerializedWorkspaceLocation::Remote(options) => {
+                    SerializedWorkspaceLocation::Remote(options)
+                        if self.style == ProjectPickerStyle::Modal =>
+                    {
                         Some(SharedString::from(options.display_name()))
                     }
                     _ => None,
@@ -1673,8 +1739,14 @@ impl PickerDelegate for RecentProjectsDelegate {
                                     if !self.render_paths {
                                         highlighted.paths.clear();
                                     }
-                                    highlighted.render(window, cx)
+                                    let label = highlighted.render(window, cx);
+                                    if self.style == ProjectPickerStyle::Popover {
+                                        div().min_w_0().flex_1().child(label).into_any_element()
+                                    } else {
+                                        label.into_any_element()
+                                    }
                                 })
+                                .children(remote_label)
                                 .tooltip(move |_, cx| {
                                     Tooltip::with_meta(
                                         primary_confirm_tooltip,
@@ -2014,6 +2086,24 @@ impl PickerDelegate for RecentProjectsDelegate {
                 .into_any(),
         )
     }
+}
+
+fn remote_project_name(
+    mut connection_options: RemoteConnectionOptions,
+    ssh_connections: &[settings::SshConnection],
+) -> String {
+    if let RemoteConnectionOptions::Ssh(options) = &mut connection_options {
+        let host = options.host.to_string();
+        if let Some(connection) = ssh_connections.iter().find(|connection| {
+            connection.host == host
+                && connection.username == options.username
+                && connection.port == options.port
+        }) {
+            options.nickname = connection.nickname.clone();
+        }
+    }
+
+    connection_options.display_name()
 }
 
 fn icon_for_project_group(key: &ProjectGroupKey) -> IconName {
@@ -2541,6 +2631,92 @@ mod tests {
     const RECENT_PROJECT_COUNT: usize = 20;
     const FIRST_RECENT_PROJECT: usize = 7;
     const LAST_RECENT_PROJECT: usize = FIRST_RECENT_PROJECT + RECENT_PROJECT_COUNT - 1;
+
+    #[test]
+    fn remote_project_name_uses_current_ssh_nickname() {
+        let options = RemoteConnectionOptions::Ssh(remote::SshConnectionOptions {
+            host: "example.com".to_string().into(),
+            username: Some("user".into()),
+            port: Some(2222),
+            nickname: Some("Old name".into()),
+            ..Default::default()
+        });
+        let mut connection = settings::SshConnection {
+            host: "example.com".into(),
+            username: Some("user".into()),
+            port: Some(2222),
+            nickname: Some("开发服务器".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            remote_project_name(options.clone(), std::slice::from_ref(&connection)),
+            "开发服务器"
+        );
+        connection.nickname = None;
+        assert_eq!(
+            remote_project_name(options.clone(), &[connection]),
+            "example.com"
+        );
+        assert_eq!(remote_project_name(options.clone(), &[]), "Old name");
+        assert_eq!(options.display_name(), "Old name");
+    }
+
+    #[test]
+    fn remote_project_name_matches_full_ssh_identity() {
+        let options = RemoteConnectionOptions::Ssh(remote::SshConnectionOptions {
+            host: "example.com".to_string().into(),
+            username: Some("user".into()),
+            port: Some(2222),
+            ..Default::default()
+        });
+        for (host, username, port) in [
+            ("other.example.com", Some("user"), Some(2222)),
+            ("example.com", Some("other-user"), Some(2222)),
+            ("example.com", None, Some(2222)),
+            ("example.com", Some("user"), Some(22)),
+            ("example.com", Some("user"), None),
+        ] {
+            let connection = settings::SshConnection {
+                host: host.into(),
+                username: username.map(str::to_string),
+                port,
+                nickname: Some("Other server".into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                remote_project_name(options.clone(), &[connection]),
+                "example.com"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_project_name_preserves_other_connection_names() {
+        assert_eq!(
+            remote_project_name(
+                RemoteConnectionOptions::Wsl(remote::WslConnectionOptions {
+                    distro_name: "Ubuntu".into(),
+                    user: None,
+                }),
+                &[],
+            ),
+            "Ubuntu"
+        );
+        for (use_podman, expected) in [(false, "container"), (true, "[podman] container")] {
+            assert_eq!(
+                remote_project_name(
+                    RemoteConnectionOptions::Docker(remote::DockerConnectionOptions {
+                        name: "container".into(),
+                        use_podman,
+                        ..Default::default()
+                    }),
+                    &[],
+                ),
+                expected
+            );
+        }
+    }
 
     fn open_folder(index: usize) -> OpenFolderEntry {
         OpenFolderEntry {
