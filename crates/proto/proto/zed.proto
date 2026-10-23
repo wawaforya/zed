@@ -524,7 +524,12 @@ message Envelope {
     ExecuteLspCommandResponse execute_lsp_command_response = 492;
     RefreshDocumentHighlights refresh_document_highlights = 493;
     GetTerminalShell get_terminal_shell = 494;
-    GetTerminalShellResponse get_terminal_shell_response = 495; // current max
+    GetTerminalShellResponse get_terminal_shell_response = 495; // upstream max
+
+    // Keep personal extensions separate from upstream message numbers.
+    ReadTabWorkspaces read_tab_workspaces = 10001;
+    ReadTabWorkspacesResponse read_tab_workspaces_response = 10002;
+    WriteTabWorkspaces write_tab_workspaces = 10003;
   }
 
   reserved 87 to 88;
