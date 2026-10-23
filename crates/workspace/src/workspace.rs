@@ -22,6 +22,7 @@ pub mod shared_screen;
 pub use shared_screen::SharedScreen;
 pub mod focus_follows_mouse;
 mod status_bar;
+mod tab_workspaces;
 pub mod tasks;
 mod theme_preview;
 mod toast_layer;
@@ -1046,12 +1047,15 @@ type BuildProjectItemForPathFn =
 
 #[derive(Clone, Default)]
 struct ProjectItemRegistry {
+    tab_workspace_item_types: HashSet<std::any::TypeId>,
     build_project_item_fns_by_type: TypeIdHashMap<BuildProjectItemFn>,
     build_project_item_for_path_fns: Vec<BuildProjectItemForPathFn>,
 }
 
 impl ProjectItemRegistry {
     fn register<T: ProjectItem>(&mut self) {
+        self.tab_workspace_item_types
+            .insert(std::any::TypeId::of::<T>());
         self.build_project_item_fns_by_type.insert(
             TypeId::of::<T::Item>(),
             |item, project, pane, window, cx| {
@@ -1652,6 +1656,7 @@ pub struct Workspace {
     persisted_recent_navigation_history: Vec<PathBuf>,
     last_active_project_path: Option<ProjectPath>,
     restoring_workspace: bool,
+    tab_workspaces: tab_workspaces::State,
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -1773,6 +1778,7 @@ impl Workspace {
                     }
                 }
                 project::Event::WorktreeUpdatedEntries(worktree_id, changes) => {
+                    this.tab_workspace_entries_changed(*worktree_id, changes, window, cx);
                     this.remove_deleted_navigation_history(*worktree_id, changes, cx);
                     this.update_window_title(window, cx);
                     this.serialize_workspace(window, cx);
@@ -1783,6 +1789,7 @@ impl Workspace {
                     new_abs_path,
                     ..
                 } => {
+                    this.rename_tab_workspace_paths(old_abs_path, new_abs_path, window, cx);
                     if this.rename_persisted_navigation_history_paths(old_abs_path, new_abs_path) {
                         this.serialize_workspace(window, cx);
                     }
@@ -2155,6 +2162,7 @@ impl Workspace {
             persisted_recent_navigation_history: Vec::new(),
             last_active_project_path: None,
             restoring_workspace: false,
+            tab_workspaces: tab_workspaces::State::default(),
         }
     }
 
@@ -3737,6 +3745,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<bool>> {
+        if self.tab_workspace_operation_in_progress() {
+            self.show_error(
+                "Please wait for the tab workspace operation to finish before closing.",
+                cx,
+            );
+            return Task::ready(Ok(false));
+        }
         let active_call = self.active_global_call();
 
         cx.spawn_in(window, async move |this, cx| {
@@ -6401,6 +6416,8 @@ impl Workspace {
 
         if serialize_workspace {
             self.serialize_workspace(window, cx);
+        } else {
+            self.schedule_tab_workspace_save(window, cx);
         }
     }
 
@@ -7810,7 +7827,13 @@ impl Workspace {
             .collect::<Vec<_>>();
         let bounds_task = self.save_window_bounds(window, cx);
         let serialize_task = self.serialize_workspace_internal(window, cx);
+        let tab_workspace_task = self.flush_tab_workspace(cx);
         cx.background_spawn(async move {
+            if let Some(task) = tab_workspace_task
+                && let Err(error) = task.await
+            {
+                log::error!("Could not flush tab workspaces: {error}");
+            }
             bounds_task.await;
             serialize_task.await;
             for result in futures::future::join_all(item_tasks).await {
@@ -7842,7 +7865,16 @@ impl Workspace {
 
     fn remove_from_session(&mut self, window: &mut Window, cx: &mut App) -> Task<()> {
         self.session_id.take();
-        self.serialize_workspace_internal(window, cx)
+        let tab_workspace_task = self.flush_tab_workspace(cx);
+        let serialize_task = self.serialize_workspace_internal(window, cx);
+        cx.background_spawn(async move {
+            if let Some(task) = tab_workspace_task
+                && let Err(error) = task.await
+            {
+                log::error!("Could not flush tab workspaces: {error}");
+            }
+            serialize_task.await;
+        })
     }
 
     fn force_remove_pane(
@@ -7873,6 +7905,7 @@ impl Workspace {
     }
 
     fn serialize_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.schedule_tab_workspace_save(window, cx);
         if self._schedule_serialize_workspace.is_none() {
             self._schedule_serialize_workspace =
                 Some(cx.spawn_in(window, async move |this, cx| {
@@ -8281,6 +8314,9 @@ impl Workspace {
                     }
                 },
             ))
+            .on_action(cx.listener(Self::edit_tab_workspaces))
+            .on_action(cx.listener(Self::new_tab_workspace))
+            .on_action(cx.listener(Self::prompt_rename_tab_workspace))
             .on_action(cx.listener(Self::close_inactive_items_and_panes))
             .on_action(cx.listener(Self::close_all_items_and_panes))
             .on_action(cx.listener(Self::close_item_in_all_panes))
@@ -9582,6 +9618,9 @@ fn open_items(
             opened_items[ix] = Some(path_open_result);
         }
 
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.initialize_tab_workspaces(window, cx);
+        })?;
         Ok(opened_items)
     })
 }

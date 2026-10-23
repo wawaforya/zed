@@ -2744,20 +2744,23 @@ impl Project {
 
         let worktree_id = worktree.read(cx).id();
         let is_root_entry = self.entry_is_worktree_root(entry_id, cx);
+        let path_style = self.path_style(cx);
 
         let lsp_store = self.lsp_store().downgrade();
         cx.spawn(async move |project, cx| {
             let (old_abs_path, new_abs_path) = {
                 let root_path = worktree.read_with(cx, |this, _| this.abs_path());
                 let new_abs_path = if is_root_entry {
-                    root_path
-                        .parent()
-                        .unwrap()
-                        .join(new_path.path.as_std_path())
+                    path_style.join(
+                        path_style.parent(&root_path).context("Worktree root has no parent")?,
+                        new_path.path.as_std_path(),
+                    )
                 } else {
-                    root_path.join(&new_path.path.as_std_path())
+                    project
+                        .read_with(cx, |project, cx| project.absolute_path(&new_path, cx))?
+                        .context("Destination worktree is no longer available")?
                 };
-                (root_path.join(old_path.as_std_path()), new_abs_path)
+                (path_style.join(&root_path, old_path.as_std_path()), new_abs_path)
             };
             let transaction = LspStore::will_rename_entry(
                 lsp_store.clone(),

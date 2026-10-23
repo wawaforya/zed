@@ -101,6 +101,10 @@ struct SearchBufferBatch {
     completion: oneshot::Sender<Result<()>>,
 }
 
+#[derive(Default)]
+struct TabWorkspaceWriteLock(Arc<futures::lock::Mutex<()>>);
+impl gpui::Global for TabWorkspaceWriteLock {}
+
 impl HeadlessProject {
     pub fn init(cx: &mut App) {
         settings::init(cx);
@@ -309,6 +313,8 @@ impl HeadlessProject {
 
         session.add_request_handler(cx.weak_entity(), Self::handle_list_remote_directory);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_path_metadata);
+        session.add_entity_request_handler(Self::handle_read_tab_workspaces);
+        session.add_entity_request_handler(Self::handle_write_tab_workspaces);
         session.add_request_handler(cx.weak_entity(), Self::handle_shutdown_remote_server);
         session.add_request_handler(cx.weak_entity(), Self::handle_ping);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_processes);
@@ -1346,7 +1352,70 @@ impl HeadlessProject {
             exists: metadata.is_some(),
             is_dir,
             path,
+            supports_tab_workspaces: true,
         })
+    }
+
+    fn tab_workspaces_path(&self, worktree_id: u64, cx: &App) -> Result<PathBuf> {
+        let worktree = self
+            .worktree_store
+            .read(cx)
+            .worktree_for_id(WorktreeId::from_proto(worktree_id), cx)
+            .context("Tab workspace folder is no longer available")?;
+        let worktree = worktree.read(cx);
+        anyhow::ensure!(
+            worktree.root_entry().is_some_and(|entry| entry.is_dir()),
+            "Tab workspaces require a project folder"
+        );
+        Ok(worktree.abs_path().join(".zed/tab-workspaces.json"))
+    }
+
+    async fn read_tab_workspaces_file(fs: &dyn Fs, path: &Path) -> Result<Option<String>> {
+        if fs.metadata(path).await?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(fs.load(path).await?))
+    }
+
+    async fn handle_read_tab_workspaces(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::ReadTabWorkspaces>,
+        cx: AsyncApp,
+    ) -> Result<proto::ReadTabWorkspacesResponse> {
+        let (fs, path) = this.read_with(&cx, |this, cx| {
+            Ok::<_, anyhow::Error>((
+                this.fs.clone(),
+                this.tab_workspaces_path(envelope.payload.worktree_id, cx)?,
+            ))
+        })?;
+        Ok(proto::ReadTabWorkspacesResponse {
+            content: Self::read_tab_workspaces_file(fs.as_ref(), &path).await?,
+        })
+    }
+
+    async fn handle_write_tab_workspaces(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::WriteTabWorkspaces>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let (fs, path) = this.read_with(&cx, |this, cx| {
+            Ok::<_, anyhow::Error>((
+                this.fs.clone(),
+                this.tab_workspaces_path(envelope.payload.worktree_id, cx)?,
+            ))
+        })?;
+        let lock = cx.update(|cx| cx.default_global::<TabWorkspaceWriteLock>().0.clone());
+        let _guard = lock.lock().await;
+        anyhow::ensure!(
+            Self::read_tab_workspaces_file(fs.as_ref(), &path).await?
+                == envelope.payload.expected_content,
+            "{} changed outside this window. Reopen the project before saving tab workspaces to avoid overwriting it.",
+            path.display()
+        );
+        fs.create_dir(path.parent().context("Missing workspace directory")?)
+            .await?;
+        fs.atomic_write(path, envelope.payload.content).await?;
+        Ok(proto::Ack {})
     }
 
     async fn handle_shutdown_remote_server(
