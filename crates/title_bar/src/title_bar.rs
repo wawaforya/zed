@@ -207,6 +207,7 @@ pub struct TitleBar {
     banner: Option<Entity<OnboardingBanner>>,
     update_version: Entity<UpdateVersion>,
     screen_share_popover_handle: PopoverMenuHandle<ContextMenu>,
+    tab_workspace_popover_handle: PopoverMenuHandle<ContextMenu>,
     _diagnostics_subscription: Option<gpui::Subscription>,
 }
 
@@ -371,6 +372,11 @@ impl Render for TitleBar {
                 .pr_1()
                 .gap_1()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .when_some(self.workspace.upgrade(), |this, workspace| {
+                    this.child(workspace.read(cx).render_tab_workspace_menu(
+                        self.tab_workspace_popover_handle.clone(),
+                    ))
+                })
                 .child(self.render_call_controls(window, cx))
                 .children(self.render_connection_status(status, cx))
                 .child(self.update_version.clone())
@@ -524,6 +530,7 @@ impl TitleBar {
             banner,
             update_version,
             screen_share_popover_handle: PopoverMenuHandle::default(),
+            tab_workspace_popover_handle: PopoverMenuHandle::default(),
             _diagnostics_subscription: None,
         };
 
