@@ -436,6 +436,7 @@ pub struct Pane {
     show_tab_bar_buttons: bool,
     max_tabs: Option<NonZeroUsize>,
     use_max_tabs: bool,
+    pub(crate) restoring_tab_workspace: bool,
     _subscriptions: Vec<Subscription>,
     tab_bar_scroll_handle: ScrollHandle,
     /// This is set to true if a user scroll has occurred more recently than a system scroll
@@ -449,6 +450,7 @@ pub struct Pane {
     close_pane_if_empty: bool,
     pub new_item_context_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub split_item_context_menu_handle: PopoverMenuHandle<ContextMenu>,
+    tab_workspace_context_menu_handle: PopoverMenuHandle<ContextMenu>,
     pinned_tab_count: usize,
     diagnostics: HashMap<ProjectPath, DiagnosticSeverity>,
     zoom_out_on_close: bool,
@@ -586,6 +588,7 @@ impl Pane {
             preview_item_id: None,
             max_tabs,
             use_max_tabs,
+            restoring_tab_workspace: false,
             last_focus_handle_by_item: Default::default(),
             nav_history: NavHistory(Arc::new(Mutex::new(NavHistoryState {
                 mode: NavigationMode::Normal,
@@ -622,6 +625,7 @@ impl Pane {
             close_pane_if_empty: true,
             split_item_context_menu_handle: Default::default(),
             new_item_context_menu_handle: Default::default(),
+            tab_workspace_context_menu_handle: Default::default(),
             pinned_tab_count: 0,
             diagnostics: Default::default(),
             zoom_out_on_close: true,
@@ -728,6 +732,7 @@ impl Pane {
     pub fn context_menu_focused(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.new_item_context_menu_handle.is_focused(window, cx)
             || self.split_item_context_menu_handle.is_focused(window, cx)
+            || self.tab_workspace_context_menu_handle.is_focused(window, cx)
     }
 
     fn focus_out(&mut self, _event: FocusOutEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1835,6 +1840,9 @@ impl Pane {
     }
 
     fn close_items_on_item_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.restoring_tab_workspace {
+            return;
+        }
         let target = self.max_tabs.map(|m| m.get());
         let protect_active_item = false;
         self.close_items_to_target_count(target, protect_active_item, window, cx);
