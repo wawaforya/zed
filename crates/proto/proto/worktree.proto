@@ -59,6 +59,23 @@ message GetPathMetadataResponse {
   bool exists = 1;
   string path = 2;
   bool is_dir = 3;
+  bool supports_tab_workspaces = 10001;
+}
+
+message ReadTabWorkspaces {
+  uint64 project_id = 1;
+  uint64 worktree_id = 2;
+}
+
+message ReadTabWorkspacesResponse {
+  optional string content = 1;
+}
+
+message WriteTabWorkspaces {
+  uint64 project_id = 1;
+  uint64 worktree_id = 2;
+  optional string expected_content = 3;
+  string content = 4;
 }
 
 message WorktreeMetadata {

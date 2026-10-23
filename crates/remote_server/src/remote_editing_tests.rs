@@ -6267,6 +6267,251 @@ pub async fn init_test(
     (project, headless)
 }
 
+#[gpui::test]
+async fn test_remote_tab_workspaces_storage(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(path!("/project"), json!({ "a.rs": "a" }))
+        .await;
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    let worktree = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/project"), true, cx)
+        })
+        .await
+        .unwrap()
+        .0;
+    let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id().to_proto());
+    let client = project.read_with(cx, |project, cx| {
+        project.remote_client().unwrap().read(cx).proto_client()
+    });
+    let read = || {
+        client.request(proto::ReadTabWorkspaces {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            worktree_id,
+        })
+    };
+    let write = |expected: Option<&str>, content: &str| {
+        client.request(proto::WriteTabWorkspaces {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            worktree_id,
+            expected_content: expected.map(str::to_owned),
+            content: content.to_owned(),
+        })
+    };
+    let storage_path = Path::new(path!("/project/.zed/tab-workspaces.json"));
+    assert_eq!(read().await.unwrap().content, None);
+    let initial = r#"{"version":1,"workspaces":[]}"#;
+    write(None, initial).await.unwrap();
+    assert_eq!(fs.load(storage_path).await.unwrap(), initial);
+    assert_eq!(read().await.unwrap().content.as_deref(), Some(initial));
+
+    // Check the file itself, not a possibly stale or dirty editor buffer.
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_buffer(
+                (
+                    project::WorktreeId::from_proto(worktree_id),
+                    rel_path(".zed/tab-workspaces.json"),
+                ),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| buffer.set_text("unsaved JSON", cx));
+    fs.atomic_write(storage_path.to_path_buf(), "external edit".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        read().await.unwrap().content.as_deref(),
+        Some("external edit")
+    );
+    assert!(write(Some(initial), "replacement").await.is_err());
+    assert_eq!(fs.load(storage_path).await.unwrap(), "external edit");
+    cx.run_until_parked();
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "unsaved JSON");
+        assert!(buffer.is_dirty());
+    });
+
+    fs.remove_file(storage_path, fs::RemoveOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(read().await.unwrap().content, None);
+    assert!(write(Some(initial), "replacement").await.is_err());
+    write(None, initial).await.unwrap();
+    assert!(
+        client
+            .request(proto::ReadTabWorkspaces {
+                project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                worktree_id: u64::MAX,
+            })
+            .await
+            .is_err()
+    );
+}
+
+#[gpui::test]
+async fn test_remote_tab_workspaces_creation_and_autosave(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    let initial = json!({
+        "version": 1,
+        "active_workspace_id": "original",
+        "workspaces": [{ "id": "original", "name": "Original", "layout": {
+            "type": "pane", "active": true, "active_tab": null, "tabs": []
+        }}]
+    })
+    .to_string();
+    fs.insert_tree(
+        path!("/project"),
+        json!({
+            "a.rs": "a", "b.rs": "b", ".zed": { "tab-workspaces.json": initial.clone() }
+        }),
+    )
+    .await;
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    cx.update(|cx| {
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::init(cx);
+    });
+    let worktree = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/project"), true, cx)
+        })
+        .await
+        .unwrap()
+        .0;
+    let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+    let local_fs = project.read_with(cx, |project, _| project.fs().clone());
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+    });
+    let workspace = root.read_with(cx, |root, _| root.workspace().clone());
+    let native = workspace
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_path((worktree_id, rel_path("a.rs")), None, true, window, cx)
+        })
+        .await
+        .unwrap();
+    let dispatch = |name: &str, cx: &mut gpui::VisualTestContext| {
+        cx.update(|window, cx| window.dispatch_action(cx.build_action(name, None).unwrap(), cx));
+        cx.run_until_parked();
+    };
+    // The first action loads the association without replacing native tabs.
+    dispatch("workspace::NewTabWorkspace", cx);
+    workspace.read_with(cx, |workspace, cx| {
+        assert_eq!(workspace.active_pane().read(cx).items_len(), 1);
+        assert_eq!(
+            workspace.active_item(cx).unwrap().item_id(),
+            native.item_id()
+        );
+    });
+    let storage_path = Path::new(path!("/project/.zed/tab-workspaces.json"));
+    assert_eq!(fs.load(storage_path).await.unwrap(), initial);
+
+    dispatch("workspace::NewTabWorkspace", cx);
+    assert!(workspace.update_in(cx, |workspace, window, cx| {
+        workspace.has_active_modal(window, cx)
+    }));
+    cx.simulate_input("Remote");
+    dispatch("menu::Confirm", cx);
+    assert!(!workspace.update_in(cx, |workspace, window, cx| {
+        workspace.has_active_modal(window, cx)
+    }));
+    workspace.read_with(cx, |workspace, cx| {
+        assert_eq!(workspace.active_pane().read(cx).items_len(), 0);
+    });
+    let document: serde_json::Value =
+        serde_json::from_str(&fs.load(storage_path).await.unwrap()).unwrap();
+    assert_eq!(
+        document["workspaces"][0]["layout"]["tabs"][0]["path"],
+        "a.rs"
+    );
+    assert_eq!(document["workspaces"][1]["name"], "Remote");
+    assert_eq!(document["workspaces"][1]["layout"]["tabs"], json!([]));
+    assert_eq!(
+        document["active_workspace_id"],
+        document["workspaces"][1]["id"]
+    );
+
+    workspace
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_path((worktree_id, rel_path("b.rs")), None, true, window, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(1));
+    cx.run_until_parked();
+    let document: serde_json::Value =
+        serde_json::from_str(&fs.load(storage_path).await.unwrap()).unwrap();
+    assert_eq!(
+        document["workspaces"][1]["layout"]["tabs"][0]["path"],
+        "b.rs"
+    );
+    assert!(local_fs.metadata(storage_path).await.unwrap().is_none());
+
+    let editor = workspace.read_with(cx, |workspace, cx| {
+        workspace.active_item_as::<Editor>(cx).unwrap()
+    });
+    editor.update_in(cx, |editor, window, cx| editor.insert("dirty", window, cx));
+    dispatch("workspace::NewTabWorkspace", cx);
+    cx.simulate_input("Cancelled");
+    dispatch("menu::Confirm", cx);
+    assert!(cx.has_pending_prompt());
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    workspace.read_with(cx, |workspace, cx| {
+        assert_eq!(workspace.active_pane().read(cx).items_len(), 1);
+    });
+    let document: serde_json::Value =
+        serde_json::from_str(&fs.load(storage_path).await.unwrap()).unwrap();
+    assert_eq!(document["workspaces"].as_array().unwrap().len(), 2);
+}
+
+#[gpui::test]
+async fn test_remote_tab_workspaces_concurrent_writes(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(path!("/project"), json!({})).await;
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    let worktree = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/project"), true, cx)
+        })
+        .await
+        .unwrap()
+        .0;
+    let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id().to_proto());
+    let client = project.read_with(cx, |project, cx| {
+        project.remote_client().unwrap().read(cx).proto_client()
+    });
+    let write = |content: &str| {
+        client.request(proto::WriteTabWorkspaces {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            worktree_id,
+            expected_content: None,
+            content: content.to_owned(),
+        })
+    };
+    let (first, second) = futures::join!(write("first"), write("second"));
+    assert_ne!(first.is_ok(), second.is_ok());
+    let saved = fs
+        .load(Path::new(path!("/project/.zed/tab-workspaces.json")))
+        .await
+        .unwrap();
+    assert_eq!(saved, if first.is_ok() { "first" } else { "second" });
+}
+
 fn init_logger() {
     zlog::init_test();
 }
